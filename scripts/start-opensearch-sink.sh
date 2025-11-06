@@ -27,6 +27,9 @@ validate_project_structure "build.gradle" "src/main/resources/application.proper
 # Set environment variables
 export QUARKUS_HTTP_PORT="$SERVICE_PORT"
 
+# Set registration host using Docker bridge detection
+set_registration_host "module-opensearch-sink" "MODULE_OPENSEARCH_SINK_HOST"
+
 # Set additional environment variables if needed
 # (OpenSearch sink uses shared infrastructure, so minimal additional config)
 
@@ -35,7 +38,8 @@ print_status "info" "Port: $SERVICE_PORT"
 print_status "info" "Description: $DESCRIPTION"
 print_status "info" "Dev Assets Location: $DEV_ASSETS_LOCATION"
 print_status "info" "Configuration:"
-echo "  HTTP/gRPC Port: $QUARKUS_HTTP_PORT"
+echo "  Service Host: $MODULE_OPENSEARCH_SINK_HOST"
+echo "  HTTP Port: $QUARKUS_HTTP_PORT"
 echo
 
 # Check if already running and offer to kill
@@ -55,5 +59,5 @@ print_status "info" "DevServices will automatically start: MySQL, Kafka, Consul,
 print_status "info" "Press Ctrl+C to stop"
 echo
 
-# Start using the app's own gradlew
-./gradlew quarkusDev
+# Start using the app's own gradlew with the detected registration host
+./gradlew quarkusDev -Dmodule.registration.host=$MODULE_OPENSEARCH_SINK_HOST
