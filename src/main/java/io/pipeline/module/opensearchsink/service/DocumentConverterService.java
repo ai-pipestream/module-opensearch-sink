@@ -2,9 +2,9 @@ package io.pipeline.module.opensearchsink.service;
 
 import com.google.protobuf.Timestamp;
 import com.google.protobuf.util.JsonFormat;
-import io.pipeline.data.model.PipeDoc;
-import io.pipeline.data.model.SemanticChunk;
-import io.pipeline.data.model.SemanticProcessingResult;
+import io.pipeline.data.v1.PipeDoc;
+import io.pipeline.data.v1.SemanticChunk;
+import io.pipeline.data.v1.SemanticProcessingResult;
 import io.pipeline.opensearch.v1.Embedding;
 import io.pipeline.opensearch.v1.OpenSearchDocument;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -28,54 +28,53 @@ public class DocumentConverterService {
             
             IndexOperation<String> indexOp = new IndexOperation.Builder<String>()
                     .index(indexName)
-                    .id(document.getId())
+                    .id(document.getDocId())
                     .document(jsonDoc)
                     .versionType(org.opensearch.client.opensearch._types.VersionType.External)
-                    .version((long) document.getLastModifiedDate().getSeconds())
+                    .version((long) document.getSearchMetadata().getLastModifiedDate().getSeconds())
                     .build();
 
             return List.of(new BulkOperation.Builder().index(indexOp).build());
         } catch (Exception e) {
-            LOG.errorf(e, "Failed to convert document %s to JSON", document.getId());
+            LOG.errorf(e, "Failed to convert document %s to JSON", document.getDocId());
             throw new RuntimeException("Document conversion failed", e);
         }
     }
 
     private OpenSearchDocument convertToOpenSearchDocument(PipeDoc document) {
         OpenSearchDocument.Builder builder = OpenSearchDocument.newBuilder()
-                .setOriginalDocId(document.getId())
-                .setDocType(document.getDocumentType())
-                .setCreatedBy(document.getCreatedBy())
-                .setCreatedAt(document.getCreatedDate())
-                .setLastModifiedAt(document.getLastModifiedDate());
+                .setOriginalDocId(document.getDocId())
+                .setDocType(document.getSearchMetadata().getDocumentType())
+                .setLastModifiedAt(document.getSearchMetadata().getLastModifiedDate());
 
-        // Set optional fields from PipeDoc
-        if (document.hasSourceUri()) {
-            builder.setSourceUri(document.getSourceUri());
+        // Set optional fields from PipeDoc search metadata
+        if (document.getSearchMetadata().hasSourceUri()) {
+            builder.setSourceUri(document.getSearchMetadata().getSourceUri());
         }
-        if (document.hasSourceMimeType()) {
-            builder.setSourceMimeType(document.getSourceMimeType());
+        if (document.getSearchMetadata().hasSourceMimeType()) {
+            builder.setSourceMimeType(document.getSearchMetadata().getSourceMimeType());
         }
-        if (document.hasTitle()) {
-            builder.setTitle(document.getTitle());
+        if (document.getSearchMetadata().hasTitle()) {
+            builder.setTitle(document.getSearchMetadata().getTitle());
         }
-        if (document.hasBody()) {
-            builder.setBody(document.getBody());
+        if (document.getSearchMetadata().hasBody()) {
+            builder.setBody(document.getSearchMetadata().getBody());
         }
-        if (document.getKeywordsCount() > 0) {
-            builder.addAllTags(document.getKeywordsList());
+        if (document.getSearchMetadata().hasKeywords() && document.getSearchMetadata().getKeywords().getKeywordCount() > 0) {
+            builder.addAllTags(document.getSearchMetadata().getKeywords().getKeywordList());
         }
-        if (document.hasRevisionId()) {
-            builder.setRevisionId(document.getRevisionId());
-        }
+        // Revision ID not available in current PipeDoc structure
+        // if (document.hasRevisionId()) {
+        //     builder.setRevisionId(document.getRevisionId());
+        // }
 
         // Convert all embeddings to nested structure
         List<Embedding> embeddings = extractAllEmbeddings(document);
         builder.addAllEmbeddings(embeddings);
 
         // Handle custom fields if present
-        if (document.hasCustomFields()) {
-            builder.setCustomFields(document.getCustomFields());
+        if (document.getSearchMetadata().hasCustomFields()) {
+            builder.setCustomFields(document.getSearchMetadata().getCustomFields());
         }
 
         return builder.build();
@@ -87,7 +86,7 @@ public class DocumentConverterService {
         // Deduplicate embeddings by composite key (chunk_config_id + embedding_id + source_text)
         Map<String, Embedding> embeddingMap = new HashMap<>();
 
-        for (SemanticProcessingResult result : document.getSemanticResultsList()) {
+        for (SemanticProcessingResult result : document.getSearchMetadata().getSemanticResultsList()) {
             String chunkConfigId = result.getChunkConfigId();
             String embeddingId = result.getEmbeddingConfigId();
             
@@ -108,9 +107,10 @@ public class DocumentConverterService {
                             .setIsPrimary(isPrimaryEmbedding(chunk, result));
 
                     // Add context text if available
-                    if (chunk.getEmbeddingInfo().getContextTextCount() > 0) {
-                        embeddingBuilder.addAllContextText(chunk.getEmbeddingInfo().getContextTextList());
-                    }
+                    // Context text not available in current ChunkEmbedding structure
+                    // if (chunk.getEmbeddingInfo().getContextTextCount() > 0) {
+                    //     embeddingBuilder.addAllContextText(chunk.getEmbeddingInfo().getContextTextList());
+                    // }
 
                     embeddingMap.put(compositeKey, embeddingBuilder.build());
                 }
