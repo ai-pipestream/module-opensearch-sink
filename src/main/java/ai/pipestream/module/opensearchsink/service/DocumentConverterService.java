@@ -42,9 +42,18 @@ public class DocumentConverterService {
     }
 
     private OpenSearchDocument convertToOpenSearchDocument(PipeDoc document) {
+        // Use last_modified_date for created_at if available, otherwise use current time
+        Timestamp createdAt = document.getSearchMetadata().hasCreationDate() 
+            ? document.getSearchMetadata().getCreationDate()
+            : (document.getSearchMetadata().hasLastModifiedDate() 
+                ? document.getSearchMetadata().getLastModifiedDate()
+                : Timestamp.getDefaultInstance());
+        
         OpenSearchDocument.Builder builder = OpenSearchDocument.newBuilder()
                 .setOriginalDocId(document.getDocId())
                 .setDocType(document.getSearchMetadata().getDocumentType())
+                .setCreatedBy("") // TODO: Populate from PipeDoc metadata when available
+                .setCreatedAt(createdAt)
                 .setLastModifiedAt(document.getSearchMetadata().getLastModifiedDate());
 
         // Set optional fields from PipeDoc search metadata

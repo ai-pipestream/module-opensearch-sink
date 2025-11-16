@@ -6,7 +6,6 @@ import ai.pipestream.ingestion.proto.MutinyOpenSearchIngestionGrpc;
 import ai.pipestream.data.module.*;
 import ai.pipestream.module.opensearchsink.service.DocumentConverterService;
 import ai.pipestream.module.opensearchsink.service.OpenSearchRepository;
-import ai.pipestream.module.opensearchsink.SchemaManagerService;
 import io.quarkus.grpc.GrpcService;
 import io.smallrye.mutiny.Multi;
 import io.smallrye.mutiny.Uni;
@@ -14,6 +13,15 @@ import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 import java.time.Instant;
 
+/**
+ * The canonical OpenSearch ingestion service and PipeStepProcessor implementation.
+ * This service handles both:
+ * 1. The gRPC OpenSearchIngestion.streamDocuments bidirectional stream
+ * 2. The PipeStepProcessor interface for pipeline module integration
+ * 
+ * All document processing flows through DocumentConverterService, which is the
+ * single source of truth for PipeDoc -> OpenSearchDocument conversion.
+ */
 @GrpcService
 public class OpenSearchIngestionServiceImpl extends MutinyOpenSearchIngestionGrpc.OpenSearchIngestionImplBase implements PipeStepProcessor {
 
@@ -45,28 +53,30 @@ public class OpenSearchIngestionServiceImpl extends MutinyOpenSearchIngestionGrp
             return Uni.createFrom().item(buildResponse(request, false, "IngestionRequest has no document."));
         }
 
-        String indexName = schemaManager.determineIndexName(request.getDocument().getDocumentType());
+        // Extract document type from PipeDoc.search_metadata
+        String documentType = request.getDocument().getSearchMetadata().getDocumentType();
+        String indexName = schemaManager.determineIndexName(documentType);
 
         return schemaManager.ensureIndexExists(indexName)
                 .onItem().transform(v -> documentConverter.prepareBulkOperations(request.getDocument(), indexName))
                 .onItem().transformToUni(openSearchRepository::bulk)
                 .onItem().transform(bulkResponse -> {
                     if (bulkResponse.errors()) {
-                        LOG.warnf("Bulk request had errors for document %s", request.getDocument().getId());
+                        LOG.warnf("Bulk request had errors for document %s", request.getDocument().getDocId());
                         return buildResponse(request, false, "Bulk operation completed with errors.");
                     } else {
-                        LOG.infof("Successfully indexed document %s", request.getDocument().getId());
+                        LOG.infof("Successfully indexed document %s", request.getDocument().getDocId());
                         return buildResponse(request, true, "Document indexed successfully.");
                     }
                 })
                 .onFailure().recoverWithItem(error -> {
-                    LOG.errorf(error, "Failed to process document %s", request.getDocument().getId());
+                    LOG.errorf(error, "Failed to process document %s", request.getDocument().getDocId());
                     return buildResponse(request, false, "Processing failed: " + error.getMessage());
                 });
     }
 
     private IngestionResponse buildResponse(IngestionRequest request, boolean success, String message) {
-        String docId = request.hasDocument() ? request.getDocument().getId() : "";
+        String docId = request.hasDocument() ? request.getDocument().getDocId() : "";
         return IngestionResponse.newBuilder()
                 .setRequestId(request.getRequestId())
                 .setDocumentId(docId)
@@ -83,7 +93,7 @@ public class OpenSearchIngestionServiceImpl extends MutinyOpenSearchIngestionGrp
         if (!request.hasDocument()) {
             return Uni.createFrom().item(ModuleProcessResponse.newBuilder()
                 .setSuccess(false)
-                .setMessage("No document provided in request")
+                .addProcessorLogs("No document provided in request")
                 .build());
         }
 
@@ -96,8 +106,8 @@ public class OpenSearchIngestionServiceImpl extends MutinyOpenSearchIngestionGrp
         return processSingleRequest(ingestionRequest)
             .map(ingestionResponse -> ModuleProcessResponse.newBuilder()
                 .setSuccess(ingestionResponse.getSuccess())
-                .setMessage(ingestionResponse.getMessage())
-                .setDocument(request.getDocument())
+                .addProcessorLogs(ingestionResponse.getMessage())
+                .setOutputDoc(request.getDocument())
                 .build());
     }
 
@@ -148,9 +158,12 @@ public class OpenSearchIngestionServiceImpl extends MutinyOpenSearchIngestionGrp
                             .setHealthCheckPassed(true)
                             .setHealthCheckMessage("OpenSearch sink module is healthy and functioning correctly");
                     } else {
+                        String errorMsg = processResponse.getProcessorLogsCount() > 0 
+                            ? processResponse.getProcessorLogs(0) 
+                            : "Health check failed";
                         responseBuilder
                             .setHealthCheckPassed(false)
-                            .setHealthCheckMessage("OpenSearch sink module health check failed: " + processResponse.getMessage());
+                            .setHealthCheckMessage("OpenSearch sink module health check failed: " + errorMsg);
                     }
                     return responseBuilder.build();
                 })
@@ -178,15 +191,16 @@ public class OpenSearchIngestionServiceImpl extends MutinyOpenSearchIngestionGrp
         if (!request.hasDocument()) {
             return Uni.createFrom().item(ModuleProcessResponse.newBuilder()
                 .setSuccess(false)
-                .setMessage("No document provided in test request")
+                .addProcessorLogs("No document provided in test request")
                 .build());
         }
 
         // Simulate successful processing
         return Uni.createFrom().item(ModuleProcessResponse.newBuilder()
             .setSuccess(true)
-            .setMessage("Test processing completed successfully - document would be indexed to OpenSearch")
-            .setDocument(request.getDocument())
+            .addProcessorLogs("Test processing completed successfully - document would be indexed to OpenSearch")
+            .setOutputDoc(request.getDocument())
             .build());
     }
 }
+
