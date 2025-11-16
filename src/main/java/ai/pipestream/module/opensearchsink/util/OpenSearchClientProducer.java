@@ -21,29 +21,30 @@ import org.opensearch.client.transport.httpclient5.ApacheHttpClient5TransportBui
 import org.opensearch.client.json.jackson.JacksonJsonpMapper;
 
 import javax.net.ssl.SSLContext;
+import java.util.Optional;
 
 @ApplicationScoped
 public class OpenSearchClientProducer {
 
-    @ConfigProperty(name = "quarkus.opensearch.hosts", defaultValue = "localhost:9200")
+    @ConfigProperty(name = "opensearch.hosts", defaultValue = "localhost:9200")
     String hosts;
 
-    @ConfigProperty(name = "quarkus.opensearch.protocol", defaultValue = "http")
+    @ConfigProperty(name = "opensearch.protocol", defaultValue = "http")
     String protocol;
 
-    @ConfigProperty(name = "quarkus.opensearch.username", defaultValue = "")
-    String username;
+    @ConfigProperty(name = "opensearch.username")
+    Optional<String> username;
 
-    @ConfigProperty(name = "quarkus.opensearch.password", defaultValue = "")
-    String password;
+    @ConfigProperty(name = "opensearch.password")
+    Optional<String> password;
 
-    @ConfigProperty(name = "quarkus.opensearch.ssl.verify", defaultValue = "true")
+    @ConfigProperty(name = "opensearch.ssl.verify", defaultValue = "true")
     boolean sslVerify;
 
-    @ConfigProperty(name = "quarkus.opensearch.connection-timeout", defaultValue = "5000")
+    @ConfigProperty(name = "opensearch.connection-timeout", defaultValue = "5000")
     int connectTimeout;
 
-    @ConfigProperty(name = "quarkus.opensearch.socket-timeout", defaultValue = "10000")
+    @ConfigProperty(name = "opensearch.socket-timeout", defaultValue = "10000")
     int socketTimeout;
 
     @Produces
@@ -63,10 +64,12 @@ public class OpenSearchClientProducer {
             var transportBuilder = ApacheHttpClient5TransportBuilder.builder(httpHosts);
             transportBuilder.setMapper(new JacksonJsonpMapper());
             transportBuilder.setHttpClientConfigCallback(httpClientBuilder -> {
-                if (username != null && !username.isBlank() && password != null && !password.isBlank()) {
+                if (username.isPresent() && password.isPresent() && 
+                    !username.get().isBlank() && !password.get().isBlank()) {
                     final var credentialsProvider = new BasicCredentialsProvider();
                     for (final var httpHost : httpHosts) {
-                        credentialsProvider.setCredentials(new AuthScope(httpHost), new UsernamePasswordCredentials(username, password.toCharArray()));
+                        credentialsProvider.setCredentials(new AuthScope(httpHost), 
+                            new UsernamePasswordCredentials(username.get(), password.get().toCharArray()));
                     }
                     httpClientBuilder.setDefaultCredentialsProvider(credentialsProvider);
                 }

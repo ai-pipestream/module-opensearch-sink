@@ -58,4 +58,12 @@ services:
     networks:
       - pipeline-test-network
     labels:
+      quarkus-dev-service-opensearch: test
+      io.quarkus.devservices.compose.wait_for.logs: ".*Node started.*"
       io.quarkus.devservices.compose.config_map.9200: opensearch.hosts
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9200/_cluster/health || exit 1"]
+      interval: 5s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
