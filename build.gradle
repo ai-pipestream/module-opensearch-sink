@@ -1,15 +1,32 @@
+import org.apache.tools.ant.filters.ReplaceTokens
+
 plugins {
+    id 'pl.allegro.tech.build.axion-release' version '1.21.0'
     alias(libs.plugins.java)
     alias(libs.plugins.quarkus)
+    alias(libs.plugins.maven.publish)
+    id 'signing'
+    id 'com.gradleup.nmcp' version '1.2.1'
 }
 
+scmVersion {
+    tag {
+        prefix = 'v'
+    }
+    checks {
+        uncommittedChanges = false
+        aheadOfRemote = false
+        snapshotDependencies = false
+    }
+}
 
+def pipelineBomVersion = findProperty('pipelineBomVersion') ?: '0.2.2'
 
 dependencies {
-    // Pipeline Dev Services extension (automatic compose infrastructure setup)
-    implementation 'io.pipeline:quarkus-pipeline-devservices:1.0.0-SNAPSHOT'
+    implementation 'io.quarkus:quarkus-container-image-docker'
+    // Import pipeline BOM to align all managed versions
+    implementation platform("ai.pipestream:pipeline-bom:${pipelineBomVersion}")
 
-    implementation platform('io.pipeline:pipeline-bom:1.0.0-SNAPSHOT')
     implementation 'io.quarkus:quarkus-grpc'
     implementation 'io.quarkus:quarkus-arc'
     implementation 'io.quarkus:quarkus-smallrye-health'
@@ -34,25 +51,42 @@ dependencies {
     testImplementation 'io.quarkus:quarkus-junit5'
     testImplementation 'io.rest-assured:rest-assured'
 
-    implementation 'io.pipeline:grpc-stubs:1.0.0-SNAPSHOT'
-    implementation 'io.pipeline:pipeline-commons'
-    implementation 'io.pipeline:pipeline-api'
-    implementation 'io.pipeline:data-util'
-    implementation 'io.pipeline:dynamic-grpc'
-    implementation 'io.pipeline:dynamic-grpc-registration-clients'
+    // Mock services for testing
+//    testImplementation project(':grpc:grpc-wiremock')
+    testImplementation libs.pipestream.grpc.wiremock
+    // Pipestream libraries - versions managed entirely by the BOM/catalog
+    implementation libs.pipestream.compose.devservices
+    implementation libs.pipestream.grpc.stubs
+    implementation libs.pipestream.commons
+    implementation libs.pipestream.data.util
+    implementation libs.pipestream.api
+    implementation libs.pipestream.dynamic.grpc
+    implementation libs.pipestream.dynamic.grpc.registration.clients
 }
 
-group 'io.pipeline.module'
-version '1.0.0-SNAPSHOT'
+group = "ai.pipestream.module"
+version = "${scmVersion.version}"
 
 java {
     sourceCompatibility = JavaVersion.VERSION_21
     targetCompatibility = JavaVersion.VERSION_21
+    withJavadocJar()
+    withSourcesJar()
 }
 
 test {
     systemProperty "java.util.logging.manager", "org.jboss.logmanager.LogManager"
+    // Increase memory for large message testing
+    jvmArgs '-Xmx4g', '-Xms1g'
 }
+
+// Integration test configuration for large messages
+tasks.withType(Test) {
+    if (name.contains('IntTest')) {
+        jvmArgs '-Xmx6g', '-XX:MaxDirectMemorySize=2g'
+    }
+}
+
 compileJava {
     options.encoding = 'UTF-8'
     options.compilerArgs << '-parameters'
@@ -60,4 +94,85 @@ compileJava {
 
 compileTestJava {
     options.encoding = 'UTF-8'
+}
+
+// Configure Javadoc task
+tasks.withType(Javadoc).configureEach { task ->
+    def opts = task.options
+    opts.encoding = 'UTF-8'
+    opts.charSet = 'UTF-8'
+    opts.locale = 'en'
+    // Suppress missing Javadoc warnings for now
+    opts.addStringOption('Xdoclint:-missing', '-quiet')
+    // Exclude internal packages
+    task.exclude('**/internal/**', '**/impl/**', '**/test/**')
+}
+
+// Enable resource filtering to replace @version@ in application.properties
+processResources {
+    filesMatching('**/*.properties') {
+        filter(ReplaceTokens, tokens: [
+                version: project.version.toString()
+        ])
+    }
+}
+
+processTestResources {
+    filesMatching('**/*.properties') {
+        filter(ReplaceTokens, tokens: [
+                version: project.version.toString()
+        ])
+    }
+}
+
+
+test {
+    systemProperty "java.util.logging.manager", "org.jboss.logmanager.LogManager"
+    // Increase memory for large message testing
+    jvmArgs '-Xmx4g', '-Xms1g'
+}
+
+// Integration test configuration for large messages
+tasks.withType(Test) {
+    if (name.contains('IntTest')) {
+        jvmArgs '-Xmx6g', '-XX:MaxDirectMemorySize=2g'
+    }
+}
+
+compileJava {
+    options.encoding = 'UTF-8'
+    options.compilerArgs << '-parameters'
+}
+
+compileTestJava {
+    options.encoding = 'UTF-8'
+}
+
+// Configure Javadoc task
+tasks.withType(Javadoc).configureEach { task ->
+    def opts = task.options
+    opts.encoding = 'UTF-8'
+    opts.charSet = 'UTF-8'
+    opts.locale = 'en'
+    // Suppress missing Javadoc warnings for now
+    opts.addStringOption('Xdoclint:-missing', '-quiet')
+    // Exclude internal packages
+    task.exclude('**/internal/**', '**/impl/**', '**/test/**')
+}
+
+// Enable resource filtering to replace @version@ in application.properties
+processResources {
+    filesMatching('**/*.properties') {
+        filter(ReplaceTokens, tokens: [
+                version: project.version.toString()
+        ])
+    }
+}
+
+processTestResources {
+    filesMatching('**/*.properties') {
+        filter(ReplaceTokens, tokens: [
+                version: project.version.toString()
+        ])
+    }
 }

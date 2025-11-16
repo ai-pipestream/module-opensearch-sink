@@ -1,51 +1,49 @@
 pluginManagement {
     repositories {
-        // Gradle Plugin Portal (proxied through Nexus)
-        maven {
-            url = uri('https://maven.rokkon.com/repository/gradle-plugins/')
-            allowInsecureProtocol = false
-        }
         gradlePluginPortal()
+        // Ensure plugins can also be resolved from Maven Central (Gradle 9+ recommendation)
         mavenCentral()
     }
 }
 
-rootProject.name = 'opensearch-sink'
+rootProject.name = 'module-opensearch-sink'
 
 dependencyResolutionManagement {
-    repositoriesMode.set(RepositoriesMode.PREFER_SETTINGS)
-
     versionCatalogs {
         libs {
             // Import version catalog from published BOM
-            from("io.pipeline:pipeline-bom-catalog:1.0.0-SNAPSHOT")
+            from("ai.pipestream:pipeline-bom-catalog:0.2.2")
         }
     }
 
     repositories {
-        // Maven Local for published Pipeline artifacts during development
-        mavenLocal() {
+        // Prefer Maven Central but allow locally published releases for development
+        mavenLocal {
+            mavenContent {
+                releasesOnly()
+            }
             content {
-                includeGroupByRegex "io\\.pipeline(\\..*)?"
+                includeGroupByRegex "ai\\.pipestream(\\..*)?"
             }
         }
 
-        // Gitea Maven registry (for BOM catalog and internal artifacts)
-        maven {
-            url = uri('https://git.rokkon.com/api/packages/io-pipeline/maven')
-            allowInsecureProtocol = false
-            content {
-                includeGroupByRegex "io\\.pipeline(\\..*)?"
-            }
-        }
-
-        // Nexus as Maven Central mirror (fast local cache on NAS)
-        maven {
-            url = uri('https://maven.rokkon.com/repository/maven-public/')
-            allowInsecureProtocol = false
-        }
-
-        // Fallback to Maven Central
         mavenCentral()
+
+        maven {
+            url = uri('https://central.sonatype.com/repository/maven-snapshots/')
+            mavenContent {
+                snapshotsOnly()
+            }
+        }
+
+        if (System.getenv('CI_ENV') != 'internal') {
+            maven {
+                url = uri('https://repository.apache.org/content/repositories/snapshots/')
+                allowInsecureProtocol = false
+                content {
+                    includeGroupByRegex "org\\.apache\\.tika(\\..*)?"
+                }
+            }
+        }
     }
 }
