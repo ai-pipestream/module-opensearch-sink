@@ -19,6 +19,7 @@ build
 .vscode/
 .claude
 .copilot*
+.dev-helpers
 
 # Package Files #
 *.jar
