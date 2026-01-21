@@ -5,7 +5,7 @@ import com.google.protobuf.util.JsonFormat;
 import ai.pipestream.data.v1.PipeDoc;
 import ai.pipestream.data.v1.SemanticChunk;
 import ai.pipestream.data.v1.SemanticProcessingResult;
-import ai.pipestream.opensearch.v1.Embedding;
+import ai.pipestream.opensearch.v1.OpenSearchEmbedding;
 import ai.pipestream.opensearch.v1.OpenSearchDocument;
 import jakarta.enterprise.context.ApplicationScoped;
 import org.jboss.logging.Logger;
@@ -78,7 +78,7 @@ public class DocumentConverterService {
         // }
 
         // Convert all embeddings to nested structure
-        List<Embedding> embeddings = extractAllEmbeddings(document);
+        List<OpenSearchEmbedding> embeddings = extractAllEmbeddings(document);
         builder.addAllEmbeddings(embeddings);
 
         // Handle custom fields if present
@@ -89,11 +89,11 @@ public class DocumentConverterService {
         return builder.build();
     }
 
-    private List<Embedding> extractAllEmbeddings(PipeDoc document) {
-        List<Embedding> embeddings = new ArrayList<>();
+    private List<OpenSearchEmbedding> extractAllEmbeddings(PipeDoc document) {
+        List<OpenSearchEmbedding> embeddings = new ArrayList<>();
         
         // Deduplicate embeddings by composite key (chunk_config_id + embedding_id + source_text)
-        Map<String, Embedding> embeddingMap = new HashMap<>();
+        Map<String, OpenSearchEmbedding> embeddingMap = new HashMap<>();
 
         for (SemanticProcessingResult result : document.getSearchMetadata().getSemanticResultsList()) {
             String chunkConfigId = result.getChunkConfigId();
@@ -108,7 +108,7 @@ public class DocumentConverterService {
                 String compositeKey = chunkConfigId + "|" + embeddingId + "|" + sourceText.hashCode();
                 
                 if (!embeddingMap.containsKey(compositeKey)) {
-                    Embedding.Builder embeddingBuilder = Embedding.newBuilder()
+                    OpenSearchEmbedding.Builder embeddingBuilder = OpenSearchEmbedding.newBuilder()
                             .addAllVector(chunk.getEmbeddingInfo().getVectorList())
                             .setSourceText(sourceText)
                             .setChunkConfigId(chunkConfigId)

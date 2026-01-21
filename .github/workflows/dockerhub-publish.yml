@@ -3,6 +3,20 @@ name: Docker Hub Publish
 on:
   repository_dispatch:
     types: [dockerhub-publish]
+  workflow_dispatch:
+    inputs:
+      base_image:
+        description: 'Base GHCR image'
+        required: true
+        default: 'ghcr.io/ai-pipestream/module-opensearch-sink'
+      dockerhub_repo:
+        description: 'Docker Hub repository'
+        required: true
+        default: 'pipestreamai/module-opensearch-sink'
+      tags:
+        description: 'Space-separated tags'
+        required: true
+        default: 'latest'
 
 jobs:
   push-to-dockerhub:
@@ -13,9 +27,12 @@ jobs:
     steps:
       - name: Validate payload
         run: |
-          echo "Payload: ${{ toJson(github.event.client_payload) }}"
-          if [ -z "${{ github.event.client_payload.base_image }}" ] || [ -z "${{ github.event.client_payload.dockerhub_repo }}" ] || [ -z "${{ github.event.client_payload.tags }}" ]; then
-            echo "Missing required client_payload fields: base_image, dockerhub_repo, tags" >&2
+          BASE_IMAGE="${{ github.event.client_payload.base_image || inputs.base_image }}"
+          DOCKERHUB_REPO="${{ github.event.client_payload.dockerhub_repo || inputs.dockerhub_repo }}"
+          TAGS="${{ github.event.client_payload.tags || inputs.tags }}"
+          echo "Payload: base_image=$BASE_IMAGE, dockerhub_repo=$DOCKERHUB_REPO, tags=$TAGS"
+          if [ -z "$BASE_IMAGE" ] || [ -z "$DOCKERHUB_REPO" ] || [ -z "$TAGS" ]; then
+            echo "Missing required fields: base_image, dockerhub_repo, tags" >&2
             exit 1
           fi
 
@@ -34,9 +51,9 @@ jobs:
 
       - name: Pull from GHCR, retag, and push to Docker Hub
         env:
-          BASE_IMAGE: ${{ github.event.client_payload.base_image }}
-          DOCKERHUB_REPO: ${{ github.event.client_payload.dockerhub_repo }}
-          TAGS: ${{ github.event.client_payload.tags }}
+          BASE_IMAGE: ${{ github.event.client_payload.base_image || inputs.base_image }}
+          DOCKERHUB_REPO: ${{ github.event.client_payload.dockerhub_repo || inputs.dockerhub_repo }}
+          TAGS: ${{ github.event.client_payload.tags || inputs.tags }}
         run: |
           set -euo pipefail
           echo "Processing tags: $TAGS"

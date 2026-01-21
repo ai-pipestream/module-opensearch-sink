@@ -5,9 +5,9 @@ import ai.pipestream.data.v1.PipeDoc;
 import ai.pipestream.data.v1.SearchMetadata;
 import ai.pipestream.data.v1.SemanticChunk;
 import ai.pipestream.data.v1.SemanticProcessingResult;
-import ai.pipestream.ingestion.proto.IngestionRequest;
-import ai.pipestream.ingestion.proto.IngestionResponse;
-import ai.pipestream.ingestion.proto.MutinyOpenSearchIngestionGrpc;
+import ai.pipestream.ingestion.v1.StreamDocumentsRequest;
+import ai.pipestream.ingestion.v1.StreamDocumentsResponse;
+import ai.pipestream.ingestion.v1.MutinyOpenSearchIngestionServiceGrpc;
 import ai.pipestream.module.opensearchsink.util.OpenSearchTestClient;
 import io.quarkus.grpc.GrpcClient;
 import io.quarkus.test.junit.QuarkusTest;
@@ -30,7 +30,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 public class OpenSearchSinkServiceTest {
 
     @GrpcClient("opensearchSink")
-    MutinyOpenSearchIngestionGrpc.MutinyOpenSearchIngestionStub ingestionClient;
+    MutinyOpenSearchIngestionServiceGrpc.MutinyOpenSearchIngestionServiceStub ingestionClient;
 
     @Inject
     SchemaManagerService schemaManager;
@@ -77,13 +77,13 @@ public class OpenSearchSinkServiceTest {
                         .build())
                 .build();
 
-        IngestionRequest request = IngestionRequest.newBuilder()
+        StreamDocumentsRequest request = StreamDocumentsRequest.newBuilder()
                 .setDocument(testDoc)
                 .setRequestId(UUID.randomUUID().toString())
                 .build();
 
         // 2. Stream the request to the service via the Mutiny stub client
-        List<IngestionResponse> responses = ingestionClient.streamDocuments(Multi.createFrom().item(request))
+        List<StreamDocumentsResponse> responses = ingestionClient.streamDocuments(Multi.createFrom().item(request))
                 .collect().asList().await().indefinitely();
 
         // 3. Assert the response

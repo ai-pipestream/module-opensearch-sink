@@ -1,29 +1,31 @@
 package ai.pipestream.module.opensearchsink;
 
-import ai.pipestream.ingestion.proto.IngestionRequest;
-import ai.pipestream.ingestion.proto.IngestionResponse;
-import ai.pipestream.ingestion.proto.MutinyOpenSearchIngestionGrpc;
-import ai.pipestream.data.module.*;
+import ai.pipestream.ingestion.v1.MutinyOpenSearchIngestionServiceGrpc;
+import ai.pipestream.ingestion.v1.StreamDocumentsRequest;
+import ai.pipestream.ingestion.v1.StreamDocumentsResponse;
+import ai.pipestream.data.module.v1.*;
 import ai.pipestream.module.opensearchsink.service.DocumentConverterService;
 import ai.pipestream.module.opensearchsink.service.OpenSearchRepository;
 import io.quarkus.grpc.GrpcService;
+import io.smallrye.common.annotation.RunOnVirtualThread;
 import io.smallrye.mutiny.Multi;
 import io.smallrye.mutiny.Uni;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
-import java.time.Instant;
 
 /**
  * The canonical OpenSearch ingestion service and PipeStepProcessor implementation.
  * This service handles both:
  * 1. The gRPC OpenSearchIngestion.streamDocuments bidirectional stream
- * 2. The PipeStepProcessor interface for pipeline module integration
- * 
+ * 2. The PipeStepProcessorService interface for pipeline module integration
+ *
  * All document processing flows through DocumentConverterService, which is the
  * single source of truth for PipeDoc -> OpenSearchDocument conversion.
  */
 @GrpcService
-public class OpenSearchIngestionServiceImpl extends MutinyOpenSearchIngestionGrpc.OpenSearchIngestionImplBase implements PipeStepProcessor {
+public class OpenSearchIngestionServiceImpl
+        extends MutinyOpenSearchIngestionServiceGrpc.OpenSearchIngestionServiceImplBase
+        implements PipeStepProcessorService {
 
     private static final Logger LOG = Logger.getLogger(OpenSearchIngestionServiceImpl.class);
 
@@ -42,15 +44,15 @@ public class OpenSearchIngestionServiceImpl extends MutinyOpenSearchIngestionGrp
     }
 
     @Override
-    public Multi<IngestionResponse> streamDocuments(Multi<IngestionRequest> requestStream) {
+    public Multi<StreamDocumentsResponse> streamDocuments(Multi<StreamDocumentsRequest> requestStream) {
         // For now, we process each request individually.
         // We will add buffering logic later based on the configuration.
         return requestStream.onItem().transformToUniAndMerge(this::processSingleRequest);
     }
 
-    private Uni<IngestionResponse> processSingleRequest(IngestionRequest request) {
+    private Uni<StreamDocumentsResponse> processSingleRequest(StreamDocumentsRequest request) {
         if (!request.hasDocument()) {
-            return Uni.createFrom().item(buildResponse(request, false, "IngestionRequest has no document."));
+            return Uni.createFrom().item(buildResponse(request, false, "StreamDocumentsRequest has no document."));
         }
 
         // Extract document type from PipeDoc.search_metadata
@@ -75,9 +77,9 @@ public class OpenSearchIngestionServiceImpl extends MutinyOpenSearchIngestionGrp
                 });
     }
 
-    private IngestionResponse buildResponse(IngestionRequest request, boolean success, String message) {
+    private StreamDocumentsResponse buildResponse(StreamDocumentsRequest request, boolean success, String message) {
         String docId = request.hasDocument() ? request.getDocument().getDocId() : "";
-        return IngestionResponse.newBuilder()
+        return StreamDocumentsResponse.newBuilder()
                 .setRequestId(request.getRequestId())
                 .setDocumentId(docId)
                 .setSuccess(success)
@@ -85,122 +87,56 @@ public class OpenSearchIngestionServiceImpl extends MutinyOpenSearchIngestionGrp
                 .build();
     }
 
-    // PipeStepProcessor interface implementation
+    // PipeStepProcessorService interface implementation
+    @RunOnVirtualThread
     @Override
-    public Uni<ModuleProcessResponse> processData(ModuleProcessRequest request) {
+    public Uni<ProcessDataResponse> processData(ProcessDataRequest request) {
         LOG.info("ProcessData called for OpenSearch sink module");
-        
+
         if (!request.hasDocument()) {
-            return Uni.createFrom().item(ModuleProcessResponse.newBuilder()
+            return Uni.createFrom().item(ProcessDataResponse.newBuilder()
                 .setSuccess(false)
                 .addProcessorLogs("No document provided in request")
                 .build());
         }
 
         // Convert to ingestion request and process
-        IngestionRequest ingestionRequest = IngestionRequest.newBuilder()
+        StreamDocumentsRequest streamRequest = StreamDocumentsRequest.newBuilder()
             .setRequestId(java.util.UUID.randomUUID().toString())
             .setDocument(request.getDocument())
             .build();
 
-        return processSingleRequest(ingestionRequest)
-            .map(ingestionResponse -> ModuleProcessResponse.newBuilder()
-                .setSuccess(ingestionResponse.getSuccess())
-                .addProcessorLogs(ingestionResponse.getMessage())
+        return processSingleRequest(streamRequest)
+            .map(streamResponse -> ProcessDataResponse.newBuilder()
+                .setSuccess(streamResponse.getSuccess())
+                .addProcessorLogs(streamResponse.getMessage())
                 .setOutputDoc(request.getDocument())
                 .build());
     }
 
+    @RunOnVirtualThread
     @Override
-    public Uni<ServiceRegistrationMetadata> getServiceRegistration(RegistrationRequest request) {
+    public Uni<GetServiceRegistrationResponse> getServiceRegistration(GetServiceRegistrationRequest request) {
         LOG.info("OpenSearch sink service registration requested");
 
-        ServiceRegistrationMetadata.Builder responseBuilder = ServiceRegistrationMetadata.newBuilder()
+        Capabilities capabilities = Capabilities.newBuilder()
+                .addTypes(CapabilityType.CAPABILITY_TYPE_SINK)
+                .build();
+
+        GetServiceRegistrationResponse.Builder responseBuilder = GetServiceRegistrationResponse.newBuilder()
                 .setModuleName("opensearch-sink")
                 .setVersion("1.0.0-SNAPSHOT")
                 .setDisplayName("OpenSearch Sink")
                 .setDescription("OpenSearch vector indexing sink with dynamic schema creation and distributed locking")
-                .setOwner("Pipeline Team")
                 .addTags("opensearch")
                 .addTags("sink")
                 .addTags("vector")
                 .addTags("indexing")
                 .addTags("module")
-                .setRegistrationTimestamp(com.google.protobuf.Timestamp.newBuilder()
-                        .setSeconds(Instant.now().getEpochSecond())
-                        .setNanos(Instant.now().getNano())
-                        .build());
-
-        // Add server info and SDK version
-        responseBuilder
-                .setServerInfo(System.getProperty("os.name") + " " + System.getProperty("os.version"))
-                .setSdkVersion("1.0.0");
-
-        // Add metadata
-        responseBuilder
-                .putMetadata("implementation_language", "Java")
-                .putMetadata("jvm_version", System.getProperty("java.version"))
-                .putMetadata("opensearch_client", "opensearch-java")
-                .putMetadata("capabilities", "vector-indexing,dynamic-schema,distributed-locking");
-
-        // Add capabilities
-        responseBuilder.setCapabilities(Capabilities.newBuilder()
-                .addTypes(CapabilityType.SINK)
-                .build());
-
-        // If test request is provided, perform health check
-        if (request.hasTestRequest()) {
-            LOG.debug("Performing health check with test request");
-            return processData(request.getTestRequest())
-                .map(processResponse -> {
-                    if (processResponse.getSuccess()) {
-                        responseBuilder
-                            .setHealthCheckPassed(true)
-                            .setHealthCheckMessage("OpenSearch sink module is healthy and functioning correctly");
-                    } else {
-                        String errorMsg = processResponse.getProcessorLogsCount() > 0 
-                            ? processResponse.getProcessorLogs(0) 
-                            : "Health check failed";
-                        responseBuilder
-                            .setHealthCheckPassed(false)
-                            .setHealthCheckMessage("OpenSearch sink module health check failed: " + errorMsg);
-                    }
-                    return responseBuilder.build();
-                })
-                .onFailure().recoverWithItem(error -> {
-                    LOG.error("Health check failed with exception", error);
-                    return responseBuilder
-                        .setHealthCheckPassed(false)
-                        .setHealthCheckMessage("Health check failed with exception: " + error.getMessage())
-                        .build();
-                });
-        } else {
-            // No test request provided, assume healthy
-            responseBuilder
+                .setCapabilities(capabilities)
                 .setHealthCheckPassed(true)
-                .setHealthCheckMessage("Service is healthy");
-            return Uni.createFrom().item(responseBuilder.build());
-        }
-    }
+                .setHealthCheckMessage("OpenSearch sink module is healthy");
 
-    @Override
-    public Uni<ModuleProcessResponse> testProcessData(ModuleProcessRequest request) {
-        LOG.info("TestProcessData called for OpenSearch sink module");
-        
-        // For test processing, we simulate the indexing without actually writing to OpenSearch
-        if (!request.hasDocument()) {
-            return Uni.createFrom().item(ModuleProcessResponse.newBuilder()
-                .setSuccess(false)
-                .addProcessorLogs("No document provided in test request")
-                .build());
-        }
-
-        // Simulate successful processing
-        return Uni.createFrom().item(ModuleProcessResponse.newBuilder()
-            .setSuccess(true)
-            .addProcessorLogs("Test processing completed successfully - document would be indexed to OpenSearch")
-            .setOutputDoc(request.getDocument())
-            .build());
+        return Uni.createFrom().item(responseBuilder.build());
     }
 }
-
