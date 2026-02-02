@@ -1,5 +1,6 @@
 package ai.pipestream.module.opensearchsink;
 
+import com.google.protobuf.Timestamp;
 import ai.pipestream.data.v1.ChunkEmbedding;
 import ai.pipestream.data.v1.PipeDoc;
 import ai.pipestream.data.v1.SearchMetadata;
@@ -9,13 +10,15 @@ import ai.pipestream.ingestion.v1.StreamDocumentsRequest;
 import ai.pipestream.ingestion.v1.StreamDocumentsResponse;
 import ai.pipestream.ingestion.v1.MutinyOpenSearchIngestionServiceGrpc;
 import ai.pipestream.module.opensearchsink.util.OpenSearchTestClient;
+import ai.pipestream.test.support.OpenSearchSinkWireMockTestResource;
 import io.quarkus.grpc.GrpcClient;
+import io.quarkus.test.common.QuarkusTestResource;
 import io.quarkus.test.junit.QuarkusTest;
 import io.smallrye.mutiny.Multi;
 import jakarta.inject.Inject;
+import org.eclipse.microprofile.config.inject.ConfigProperty;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
-import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
@@ -25,8 +28,8 @@ import java.util.UUID;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-@Disabled
 @QuarkusTest
+@QuarkusTestResource(OpenSearchSinkWireMockTestResource.class)
 public class OpenSearchSinkServiceTest {
 
     @GrpcClient("opensearchSink")
@@ -35,16 +38,18 @@ public class OpenSearchSinkServiceTest {
     @Inject
     SchemaManagerService schemaManager;
 
+    @ConfigProperty(name = "opensearch.hosts", defaultValue = "localhost:9200")
+    String opensearchHosts;
+
     private OpenSearchTestClient testClient;
     private String indexName;
 
     @BeforeEach
     void setUp() {
-        // The test container port is mapped to a random port, but inside the container it's 9200.
-        // The application connects to the container via the dev service name.
-        // The test client connects via localhost and the mapped port.
-        // For simplicity in this test, we assume the default port 9200 is used, as it is in the docker-compose.
-        testClient = new OpenSearchTestClient("localhost", 9200);
+        String[] hostPort = opensearchHosts.split(":", 2);
+        String host = hostPort.length > 0 ? hostPort[0] : "localhost";
+        int port = hostPort.length > 1 ? Integer.parseInt(hostPort[1]) : 9200;
+        testClient = new OpenSearchTestClient(host, port);
         indexName = schemaManager.determineIndexName("test-doc");
     }
 
@@ -57,10 +62,12 @@ public class OpenSearchSinkServiceTest {
     @Test
     void testStreamDocuments() throws IOException {
         // 1. Prepare the test data
+        long now = System.currentTimeMillis() / 1000;
         PipeDoc testDoc = PipeDoc.newBuilder()
                 .setDocId("doc-123")
                 .setSearchMetadata(SearchMetadata.newBuilder()
                         .setDocumentType("test-doc")
+                        .setLastModifiedDate(Timestamp.newBuilder().setSeconds(now).build())
                         .addSemanticResults(SemanticProcessingResult.newBuilder()
                                 .setChunkConfigId("test-chunker-v1")
                                 .setEmbeddingConfigId("test-embedder-v1")

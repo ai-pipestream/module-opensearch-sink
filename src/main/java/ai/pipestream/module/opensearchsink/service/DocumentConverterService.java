@@ -1,5 +1,6 @@
 package ai.pipestream.module.opensearchsink.service;
 
+import com.google.protobuf.ByteString;
 import com.google.protobuf.Timestamp;
 import com.google.protobuf.util.JsonFormat;
 import ai.pipestream.data.v1.PipeDoc;
@@ -9,32 +10,42 @@ import ai.pipestream.opensearch.v1.OpenSearchEmbedding;
 import ai.pipestream.opensearch.v1.OpenSearchDocument;
 import jakarta.enterprise.context.ApplicationScoped;
 import org.jboss.logging.Logger;
-import org.opensearch.client.opensearch.core.bulk.BulkOperation;
-import org.opensearch.client.opensearch.core.bulk.IndexOperation;
+import org.opensearch.protobufs.BulkRequest;
+import org.opensearch.protobufs.BulkRequestBody;
+import org.opensearch.protobufs.IndexOperation;
+import org.opensearch.protobufs.OperationContainer;
 
 import java.util.*;
-import java.util.stream.Collectors;
 
 @ApplicationScoped
 public class DocumentConverterService {
 
     private static final Logger LOG = Logger.getLogger(DocumentConverterService.class);
 
-    public List<BulkOperation> prepareBulkOperations(PipeDoc document, String indexName) {
+    /**
+     * Prepare a gRPC BulkRequest for indexing the document via DocumentService.
+     */
+    public BulkRequest prepareBulkRequest(PipeDoc document, String indexName) {
         OpenSearchDocument osDoc = convertToOpenSearchDocument(document);
-        
+
         try {
             String jsonDoc = JsonFormat.printer().print(osDoc);
-            
-            IndexOperation<String> indexOp = new IndexOperation.Builder<String>()
-                    .index(indexName)
-                    .id(document.getDocId())
-                    .document(jsonDoc)
-                    .versionType(org.opensearch.client.opensearch._types.VersionType.External)
-                    .version((long) document.getSearchMetadata().getLastModifiedDate().getSeconds())
+            ByteString docBytes = ByteString.copyFromUtf8(jsonDoc);
+
+            IndexOperation indexOp = IndexOperation.newBuilder()
+                    .setXIndex(indexName)
+                    .setXId(document.getDocId())
                     .build();
 
-            return List.of(new BulkOperation.Builder().index(indexOp).build());
+            BulkRequestBody body = BulkRequestBody.newBuilder()
+                    .setOperationContainer(OperationContainer.newBuilder().setIndex(indexOp).build())
+                    .setObject(docBytes)
+                    .build();
+
+            return BulkRequest.newBuilder()
+                    .setIndex(indexName)
+                    .addBulkRequestBody(body)
+                    .build();
         } catch (Exception e) {
             LOG.errorf(e, "Failed to convert document %s to JSON", document.getDocId());
             throw new RuntimeException("Document conversion failed", e);

@@ -11,7 +11,7 @@ plugins {
     alias(libs.plugins.proto.toolchain)
 }
 
-def pipestreamBomVersion = findProperty('pipestreamBomVersion') ?: '0.7.19-SNAPSHOT'
+def pipestreamBomVersion = findProperty('pipestreamBomVersion') ?: '0.7.20-SNAPSHOT'
 
 // Axion-release configuration for automatic versioning
 scmVersion {
@@ -53,7 +53,6 @@ dependencies {
     implementation 'io.quarkus:quarkus-rest-jackson'
     implementation 'io.quarkus:quarkus-smallrye-health'
     implementation 'io.quarkus:quarkus-smallrye-stork'
-    implementation 'io.quarkus:quarkus-smallrye-openapi'
     implementation 'io.quarkus:quarkus-hibernate-validator'
     implementation 'io.quarkus:quarkus-container-image-docker'
 
@@ -61,7 +60,9 @@ dependencies {
     implementation 'io.smallrye.stork:stork-service-discovery-consul'
     implementation 'io.smallrye.reactive:smallrye-mutiny-vertx-consul-client'
 
-    // OpenSearch Java Client
+    // Pipestream OpenSearch extension (provides OpenSearchClient, ReactiveOpenSearchClient)
+    implementation 'ai.pipestream:pipestream-opensearch'
+    // OpenSearch Java client types (mapping types for schema, etc.)
     implementation libs.opensearch.java
 
     // Redis Client for distributed locking
@@ -71,6 +72,7 @@ dependencies {
     implementation 'ai.pipestream:pipestream-quarkus-devservices'
     implementation 'ai.pipestream:quarkus-dynamic-grpc'
     implementation 'ai.pipestream:pipestream-service-registration'
+    implementation 'ai.pipestream:pipestream-server'
 
     // Protobuf JSON utilities
     implementation 'com.google.protobuf:protobuf-java-util'
@@ -79,7 +81,7 @@ dependencies {
     testImplementation platform("ai.pipestream:pipestream-bom:${pipestreamBomVersion}")
     testImplementation 'io.quarkus:quarkus-junit5'
     testImplementation 'io.rest-assured:rest-assured'
-    testImplementation(testFixtures('ai.pipestream:pipestream-test-support'))
+    testImplementation('ai.pipestream:pipestream-test-support')
 
     runtimeOnly libs.quarkus.logging.manager
 }

@@ -4,9 +4,9 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
-// import io.quarkus.cache.CacheResult; // Cache dependency not needed for now
+import ai.pipestream.module.opensearchsink.config.OpenSearchSinkConfig;
 import jakarta.enterprise.context.ApplicationScoped;
-import org.eclipse.microprofile.config.inject.ConfigProperty;
+import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
@@ -27,46 +27,34 @@ public class OpenSearchSettings {
     // Cache for dynamic fields to track new fields across requests
     private final Map<String, Map<String, String>> dynamicFieldsCache = new ConcurrentHashMap<>();
     
-    @ConfigProperty(name = "opensearch.default.index-prefix")
-    String defaultIndexPrefix;
-    
-    @ConfigProperty(name = "opensearch.default.vector-dimension")
-    int defaultVectorDimension;
-    
-    @ConfigProperty(name = "opensearch.default.vector-space-type")
-    String defaultVectorSpaceType;
-    
-    @ConfigProperty(name = "opensearch.cluster.name", defaultValue = "opensearch-cluster")
-    String clusterName;
-    
-    @ConfigProperty(name = "opensearch.pipeline.name", defaultValue = "default-pipeline")
-    String pipelineName;
+    @Inject
+    OpenSearchSinkConfig sinkConfig;
     
     // ConsulClient injection removed for now - can be added later for schema storage
     
     /**
      * Get the index schema for the specified index name.
-     * This method is cached using Quarkus cache to improve performance.
-     * 
+     * Returns from cache if present. When not cached, requires dimension (from opensearch-manager or document).
+     *
      * @param indexName The name of the index
-     * @return The index schema
+     * @param dimension Vector dimension when creating new schema; required for cache miss
+     * @return The index schema, or null if not cached and dimension is invalid
      */
-    // @CacheResult(cacheName = "index-schema-cache") // Cache dependency not needed for now
-    public IndexSchema getIndexSchema(String indexName) {
+    public IndexSchema getIndexSchema(String indexName, int dimension) {
         LOG.debugf("Getting index schema for %s", indexName);
-        
-        // Check local cache first
+
         if (indexSchemaCache.containsKey(indexName)) {
             LOG.debugf("Found index schema in local cache for %s", indexName);
             return indexSchemaCache.get(indexName);
         }
-        
-        // TODO: Try to get from Consul (ConsulClient injection disabled for now)
-        // Consul integration can be added later for centralized schema storage
-        
-        // Create a new schema if not found
-        LOG.debugf("Creating new index schema for %s", indexName);
-        IndexSchema schema = new IndexSchema(indexName, defaultVectorDimension, "default", defaultVectorSpaceType);
+
+        if (dimension <= 0) {
+            LOG.warnf("Cannot create index schema for %s: dimension must be > 0", indexName);
+            return null;
+        }
+
+        LOG.debugf("Creating new index schema for %s (dimension=%d)", indexName, dimension);
+        IndexSchema schema = new IndexSchema(indexName, dimension, "default", sinkConfig.vectorSpaceType());
         indexSchemaCache.put(indexName, schema);
         return schema;
     }
@@ -114,7 +102,7 @@ public class OpenSearchSettings {
      * @return The cluster name
      */
     public String getClusterName() {
-        return clusterName;
+        return sinkConfig.clusterName();
     }
     
     /**
@@ -123,7 +111,7 @@ public class OpenSearchSettings {
      * @return The pipeline name
      */
     public String getPipelineName() {
-        return pipelineName;
+        return sinkConfig.pipelineName();
     }
     
     /**
@@ -132,7 +120,7 @@ public class OpenSearchSettings {
      * @return The default vector space type
      */
     public String getDefaultVectorSpaceType() {
-        return defaultVectorSpaceType;
+        return sinkConfig.vectorSpaceType();
     }
     
     /**

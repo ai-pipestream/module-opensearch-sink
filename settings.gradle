@@ -1,8 +1,8 @@
 pluginManagement {
     repositories {
-        mavenLocal()
         gradlePluginPortal()
         mavenCentral()
+        mavenLocal()
     }
 }
 
@@ -13,7 +13,7 @@ dependencyResolutionManagement {
 
     versionCatalogs {
         libs {
-            from("ai.pipestream:pipestream-bom-catalog:${settings.gradle.startParameter.projectProperties['pipestreamBomVersion'] ?: '0.7.19-SNAPSHOT'}")
+            from("ai.pipestream:pipestream-bom-catalog:${settings.gradle.startParameter.projectProperties['pipestreamBomVersion'] ?: '0.7.20-SNAPSHOT'}")
         }
     }
 

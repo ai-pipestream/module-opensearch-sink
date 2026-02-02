@@ -59,13 +59,28 @@ public class OpenSearchIngestionServiceImpl
         String documentType = request.getDocument().getSearchMetadata().getDocumentType();
         String indexName = schemaManager.determineIndexName(documentType);
 
-        return schemaManager.ensureIndexExists(indexName)
-                .onItem().transform(v -> documentConverter.prepareBulkOperations(request.getDocument(), indexName))
+        return schemaManager.ensureIndexExists(indexName, request.getDocument())
+                .onItem().transform(v -> documentConverter.prepareBulkRequest(request.getDocument(), indexName))
                 .onItem().transformToUni(openSearchRepository::bulk)
                 .onItem().transform(bulkResponse -> {
-                    if (bulkResponse.errors()) {
-                        LOG.warnf("Bulk request had errors for document %s", request.getDocument().getDocId());
-                        return buildResponse(request, false, "Bulk operation completed with errors.");
+                    if (bulkResponse.getErrors()) {
+                        String errDetail = bulkResponse.getItemsList().stream()
+                                .filter(i -> (i.hasIndex() && i.getIndex().hasError()) || (i.hasCreate() && i.getCreate().hasError()))
+                                .map(i -> {
+                                    if (i.hasIndex() && i.getIndex().hasError()) {
+                                        var e = i.getIndex().getError();
+                                        return e.getType() + ": " + e.getReason();
+                                    }
+                                    if (i.hasCreate() && i.getCreate().hasError()) {
+                                        var e = i.getCreate().getError();
+                                        return e.getType() + ": " + e.getReason();
+                                    }
+                                    return "unknown";
+                                })
+                                .findFirst()
+                                .orElse("unknown");
+                        LOG.warnf("Bulk gRPC request had errors for document %s: %s", request.getDocument().getDocId(), errDetail);
+                        return buildResponse(request, false, "Bulk operation completed with errors: " + errDetail);
                     } else {
                         LOG.infof("Successfully indexed document %s", request.getDocument().getDocId());
                         return buildResponse(request, true, "Document indexed successfully.");

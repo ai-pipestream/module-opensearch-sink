@@ -1,31 +1,26 @@
 package ai.pipestream.module.opensearchsink.service;
 
-import ai.pipestream.module.opensearchsink.opensearch.ReactiveOpenSearchClient;
+import ai.pipestream.quarkus.opensearch.grpc.OpenSearchGrpcClientProducer;
 import io.smallrye.mutiny.Uni;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
-import org.opensearch.client.opensearch.core.BulkRequest;
-import org.opensearch.client.opensearch.core.BulkResponse;
-import org.opensearch.client.opensearch.core.bulk.BulkOperation;
-
-import java.util.List;
+import org.opensearch.protobufs.BulkRequest;
+import org.opensearch.protobufs.BulkResponse;
 
 @ApplicationScoped
 public class OpenSearchRepository {
 
-    private final ReactiveOpenSearchClient reactiveClient;
+    private final OpenSearchGrpcClientProducer grpcClient;
 
     @Inject
-    public OpenSearchRepository(ReactiveOpenSearchClient reactiveClient) {
-        this.reactiveClient = reactiveClient;
+    public OpenSearchRepository(OpenSearchGrpcClientProducer grpcClient) {
+        this.grpcClient = grpcClient;
     }
 
-    public Uni<BulkResponse> bulk(List<BulkOperation> operations) {
-        if (operations == null || operations.isEmpty()) {
-            return Uni.createFrom().item(BulkResponse.of(b -> b.items(List.of()).errors(false).took(0)));
-        }
-        BulkRequest bulkRequest = new BulkRequest.Builder().operations(operations).build();
-        // Use the reactive client which handles the blocking call and checked exception
-        return reactiveClient.bulk(bulkRequest);
+    /**
+     * Execute a bulk index request via OpenSearch DocumentService gRPC.
+     */
+    public Uni<BulkResponse> bulk(BulkRequest request) {
+        return grpcClient.bulk(request);
     }
 }
