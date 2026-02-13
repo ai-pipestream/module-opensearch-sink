@@ -95,13 +95,13 @@ java {
 
 test {
     systemProperty "java.util.logging.manager", "org.jboss.logmanager.LogManager"
-    jvmArgs '-Xmx4g', '-Xms1g'
+    jvmArgs '-Xmx4g', '-Xms1g', '--add-opens', 'java.base/java.lang=ALL-UNNAMED', '--add-opens', 'java.base/java.lang.invoke=ALL-UNNAMED'
 }
 
 // Integration test configuration for large messages
 tasks.withType(Test) {
     if (name.contains('IntTest')) {
-        jvmArgs '-Xmx6g', '-XX:MaxDirectMemorySize=2g'
+        jvmArgs '-Xmx6g', '-XX:MaxDirectMemorySize=2g', '--add-opens', 'java.base/java.lang=ALL-UNNAMED', '--add-opens', 'java.base/java.lang.invoke=ALL-UNNAMED'
     }
 }
 
@@ -142,7 +142,7 @@ processTestResources {
 }
 
 quarkusDev {
-    jvmArgs = ["-Xmx4g", "-Xms1g", "--add-opens", "java.base/java.lang=ALL-UNNAMED"]
+    jvmArgs = ["-Xmx4g", "-Xms1g", "--add-opens", "java.base/java.lang=ALL-UNNAMED", "--add-opens", "java.base/java.lang.invoke=ALL-UNNAMED"]
 }
 
 // Publishing configuration
