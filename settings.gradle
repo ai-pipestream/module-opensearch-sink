@@ -13,7 +13,7 @@ dependencyResolutionManagement {
 
     versionCatalogs {
         libs {
-            from("ai.pipestream:pipestream-bom-catalog:${settings.gradle.startParameter.projectProperties['pipestreamBomVersion'] ?: '0.7.20'}")
+            from("ai.pipestream:pipestream-bom-catalog:${pipestreamBomVersion}")
         }
     }
 

@@ -11,7 +11,7 @@ plugins {
     alias(libs.plugins.proto.toolchain)
 }
 
-def pipestreamBomVersion = findProperty('pipestreamBomVersion') ?: '0.7.20'
+def pipestreamBomVersion = findProperty('pipestreamBomVersion')
 
 // Axion-release configuration for automatic versioning
 scmVersion {
@@ -64,9 +64,6 @@ dependencies {
     implementation 'ai.pipestream:pipestream-opensearch'
     // OpenSearch Java client types (mapping types for schema, etc.)
     implementation libs.opensearch.java
-
-    // Redis Client for distributed locking
-    implementation 'io.quarkus:quarkus-redis-client'
 
     // Pipestream platform libraries
     implementation 'ai.pipestream:pipestream-quarkus-devservices'

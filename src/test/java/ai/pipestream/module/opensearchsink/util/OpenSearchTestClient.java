@@ -1,5 +1,6 @@
 package ai.pipestream.module.opensearchsink.util;
 
+import org.apache.hc.client5.http.config.RequestConfig;
 import org.apache.hc.core5.http.HttpHost;
 import org.opensearch.client.opensearch.OpenSearchClient;
 import org.opensearch.client.opensearch.core.CountRequest;
@@ -24,6 +25,13 @@ public class OpenSearchTestClient {
         HttpHost httpHost = new HttpHost("http", host, port);
         ApacheHttpClient5Transport transport = ApacheHttpClient5TransportBuilder.builder(httpHost)
                 .setMapper(new JacksonJsonpMapper())
+                .setHttpClientConfigCallback(httpClientBuilder -> {
+                    RequestConfig requestConfig = RequestConfig.custom()
+                            .setContentCompressionEnabled(false)
+                            .build();
+                    httpClientBuilder.setDefaultRequestConfig(requestConfig);
+                    return httpClientBuilder;
+                })
                 .build();
         this.client = new OpenSearchClient(transport);
     }

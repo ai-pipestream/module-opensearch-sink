@@ -10,6 +10,7 @@ import io.smallrye.mutiny.Uni;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
+import org.opensearch.client.opensearch._types.OpenSearchException;
 import org.opensearch.client.opensearch._types.mapping.KnnVectorProperty;
 import org.opensearch.client.opensearch._types.mapping.NestedProperty;
 import org.opensearch.client.opensearch._types.mapping.Property;
@@ -153,6 +154,12 @@ public class SchemaManagerService {
             try {
                 reactiveOpenSearchClient.getClient().indices().create(createRequest);
                 return (Void) null;
+            } catch (OpenSearchException e) {
+                if (e.getMessage() != null && e.getMessage().contains("resource_already_exists_exception")) {
+                    LOG.infof("Index %s already exists (concurrent creation), continuing", indexName);
+                    return (Void) null;
+                }
+                throw new RuntimeException("Failed to create index " + indexName, e);
             } catch (Exception e) {
                 throw new RuntimeException("Failed to create index " + indexName, e);
             }
