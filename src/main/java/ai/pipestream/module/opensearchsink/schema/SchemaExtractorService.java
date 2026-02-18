@@ -169,6 +169,14 @@ public class SchemaExtractorService {
         return builder.build();
     }
 
+    private boolean shouldSkipKey(String key, JsonValue value) {
+        if (key.startsWith("x-")) return true;
+        if ("format".equals(key) && value.getValueType() == JsonValue.ValueType.STRING) {
+            return OPENAPI_ONLY_FORMATS.contains(((JsonString) value).getString());
+        }
+        return false;
+    }
+
     private JsonObject resolveRefsAndClean(JsonObject node, JsonObject componentsSchemas) {
         if (node.containsKey("$ref")) {
             String ref = node.getString("$ref", null);
@@ -179,7 +187,7 @@ public class SchemaExtractorService {
             resolvedBase.forEach(builder::add);
 
             for (String key : node.keySet()) {
-                if ("$ref".equals(key) || key.startsWith("x-")) continue;
+                if ("$ref".equals(key) || shouldSkipKey(key, node.get(key))) continue;
                 var value = node.get(key);
                 if (value instanceof JsonObject) {
                     builder.add(key, resolveRefsAndClean((JsonObject) value, componentsSchemas));
@@ -194,7 +202,7 @@ public class SchemaExtractorService {
 
         var builder = Json.createObjectBuilder();
         for (String key : node.keySet()) {
-            if (key.startsWith("x-")) continue;
+            if (shouldSkipKey(key, node.get(key))) continue;
             var value = node.get(key);
             if (value instanceof JsonObject) {
                 builder.add(key, resolveRefsAndClean((JsonObject) value, componentsSchemas));

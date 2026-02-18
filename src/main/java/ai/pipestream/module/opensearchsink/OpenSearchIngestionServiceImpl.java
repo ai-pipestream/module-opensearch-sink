@@ -4,6 +4,7 @@ import ai.pipestream.ingestion.v1.MutinyOpenSearchIngestionServiceGrpc;
 import ai.pipestream.ingestion.v1.StreamDocumentsRequest;
 import ai.pipestream.ingestion.v1.StreamDocumentsResponse;
 import ai.pipestream.data.module.v1.*;
+import ai.pipestream.module.opensearchsink.schema.SchemaExtractorService;
 import ai.pipestream.module.opensearchsink.service.DocumentConverterService;
 import ai.pipestream.module.opensearchsink.service.OpenSearchRepository;
 import io.quarkus.grpc.GrpcService;
@@ -32,15 +33,18 @@ public class OpenSearchIngestionServiceImpl
     private final SchemaManagerService schemaManager;
     private final DocumentConverterService documentConverter;
     private final OpenSearchRepository openSearchRepository;
+    private final SchemaExtractorService schemaExtractorService;
 
     @Inject
     public OpenSearchIngestionServiceImpl(
             SchemaManagerService schemaManager,
             DocumentConverterService documentConverter,
-            OpenSearchRepository openSearchRepository) {
+            OpenSearchRepository openSearchRepository,
+            SchemaExtractorService schemaExtractorService) {
         this.schemaManager = schemaManager;
         this.documentConverter = documentConverter;
         this.openSearchRepository = openSearchRepository;
+        this.schemaExtractorService = schemaExtractorService;
     }
 
     @Override
@@ -151,6 +155,9 @@ public class OpenSearchIngestionServiceImpl
                 .setCapabilities(capabilities)
                 .setHealthCheckPassed(true)
                 .setHealthCheckMessage("OpenSearch sink module is healthy");
+
+        schemaExtractorService.extractConfigSchemaResolvedForJsonForms()
+                .ifPresent(responseBuilder::setJsonConfigSchema);
 
         return Uni.createFrom().item(responseBuilder.build());
     }
