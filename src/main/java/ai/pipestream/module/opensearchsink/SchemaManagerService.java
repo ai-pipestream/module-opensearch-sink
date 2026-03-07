@@ -5,6 +5,7 @@ import ai.pipestream.module.opensearchsink.config.OpenSearchSinkConfig;
 import ai.pipestream.opensearch.v1.MutinyOpenSearchManagerServiceGrpc;
 import ai.pipestream.quarkus.opensearch.client.ReactiveOpenSearchClient;
 import ai.pipestream.schemamanager.v1.EnsureNestedEmbeddingsFieldExistsRequest;
+import ai.pipestream.schemamanager.v1.VectorFieldDefinition;
 import io.quarkus.grpc.GrpcClient;
 import io.smallrye.mutiny.Uni;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -19,7 +20,9 @@ import org.opensearch.client.opensearch._types.mapping.TypeMapping;
 import org.opensearch.client.opensearch.indices.CreateIndexRequest;
 import org.opensearch.client.opensearch.indices.IndexSettings;
 
+import java.util.HashSet;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * Service responsible for managing OpenSearch index schemas.
@@ -75,7 +78,7 @@ public class SchemaManagerService {
                         LOG.debugf("Index %s already exists", indexName);
                         return Uni.createFrom().voidItem();
                     }
-                    return ensureSchemaViaOpenSearchManager(indexName)
+                    return ensureSchemaViaOpenSearchManager(indexName, document)
                             .onFailure().recoverWithUni(e -> {
                                 LOG.debugf(e, "opensearch-manager unavailable for schema, falling back to document-derived dimension");
                                 return createIndexWithDocumentDimension(indexName, document);
@@ -86,16 +89,39 @@ public class SchemaManagerService {
     /**
      * Try opensearch-manager first. Dimensions resolved from IndexEmbeddingBinding in DB.
      */
-    private Uni<Void> ensureSchemaViaOpenSearchManager(String indexName) {
+    private Uni<Void> ensureSchemaViaOpenSearchManager(String indexName, PipeDoc document) {
         if (!useOpenSearchManager()) {
             return Uni.createFrom().failure(new IllegalStateException("opensearch-manager disabled"));
         }
-        var request = EnsureNestedEmbeddingsFieldExistsRequest.newBuilder()
+
+        Set<Integer> dimensions = extractEmbeddingDimensions(document);
+        if (dimensions.isEmpty()) {
+            return Uni.createFrom().failure(new IllegalArgumentException(
+                    "Cannot create index: no embeddings in document and opensearch-manager unavailable. " +
+                            "Either configure IndexEmbeddingBinding in opensearch-manager or ensure documents have embeddings."));
+        }
+
+        if (dimensions.size() > 1) {
+            LOG.warnf("Document has mixed embedding dimensions for index %s: %s; using first dimension for nested mapping", indexName, dimensions);
+        }
+
+        int dimension = dimensions.stream()
+                .sorted()
+                .findFirst()
+                .orElse(0);
+
+        VectorFieldDefinition vectorDef = VectorFieldDefinition.newBuilder()
+                .setDimension(dimension)
+                .build();
+
+        EnsureNestedEmbeddingsFieldExistsRequest request = EnsureNestedEmbeddingsFieldExistsRequest.newBuilder()
                 .setIndexName(indexName)
                 .setNestedFieldName(NESTED_FIELD_NAME)
+                .setVectorFieldDefinition(vectorDef)
                 .build();
+
         return openSearchManagerClient.ensureNestedEmbeddingsFieldExists(request)
-                .onItem().transform(r -> (Void) null);
+                .map(r -> (Void) null);
     }
 
     /**
@@ -124,6 +150,25 @@ public class SchemaManagerService {
             }
         }
         return 0;
+    }
+
+    private Set<Integer> extractEmbeddingDimensions(PipeDoc document) {
+        Set<Integer> dimensions = new HashSet<>();
+        if (document == null || !document.hasSearchMetadata()) {
+            return dimensions;
+        }
+
+        for (var result : document.getSearchMetadata().getSemanticResultsList()) {
+            for (var chunk : result.getChunksList()) {
+                if (chunk.hasEmbeddingInfo()) {
+                    int vectorCount = chunk.getEmbeddingInfo().getVectorCount();
+                    if (vectorCount > 0) {
+                        dimensions.add(vectorCount);
+                    }
+                }
+            }
+        }
+        return dimensions;
     }
 
     private Uni<Void> createIndexWithDimension(String indexName, int dimension) {
