@@ -6,7 +6,6 @@ import ai.pipestream.ingestion.v1.StreamDocumentsResponse;
 import ai.pipestream.data.module.v1.*;
 import ai.pipestream.module.opensearchsink.schema.SchemaExtractorService;
 import ai.pipestream.module.opensearchsink.service.DocumentConverterService;
-import ai.pipestream.module.opensearchsink.service.OpenSearchRepository;
 import io.quarkus.grpc.GrpcService;
 import io.smallrye.common.annotation.RunOnVirtualThread;
 import io.smallrye.mutiny.Multi;
@@ -16,12 +15,7 @@ import org.jboss.logging.Logger;
 
 /**
  * The canonical OpenSearch ingestion service and PipeStepProcessor implementation.
- * This service handles both:
- * 1. The gRPC OpenSearchIngestion.streamDocuments bidirectional stream
- * 2. The PipeStepProcessorService interface for pipeline module integration
- *
- * All document processing flows through DocumentConverterService, which is the
- * single source of truth for PipeDoc -> OpenSearchDocument conversion.
+ * This service delegates all indexing and schema management to the OpenSearch Manager.
  */
 @GrpcService
 public class OpenSearchIngestionServiceImpl
@@ -31,26 +25,18 @@ public class OpenSearchIngestionServiceImpl
     private static final Logger LOG = Logger.getLogger(OpenSearchIngestionServiceImpl.class);
 
     private final SchemaManagerService schemaManager;
-    private final DocumentConverterService documentConverter;
-    private final OpenSearchRepository openSearchRepository;
     private final SchemaExtractorService schemaExtractorService;
 
     @Inject
     public OpenSearchIngestionServiceImpl(
             SchemaManagerService schemaManager,
-            DocumentConverterService documentConverter,
-            OpenSearchRepository openSearchRepository,
             SchemaExtractorService schemaExtractorService) {
         this.schemaManager = schemaManager;
-        this.documentConverter = documentConverter;
-        this.openSearchRepository = openSearchRepository;
         this.schemaExtractorService = schemaExtractorService;
     }
 
     @Override
     public Multi<StreamDocumentsResponse> streamDocuments(Multi<StreamDocumentsRequest> requestStream) {
-        // For now, we process each request individually.
-        // We will add buffering logic later based on the configuration.
         return requestStream.onItem().transformToUniAndMerge(this::processSingleRequest);
     }
 
@@ -63,36 +49,14 @@ public class OpenSearchIngestionServiceImpl
         String documentType = request.getDocument().getSearchMetadata().getDocumentType();
         String indexName = schemaManager.determineIndexName(documentType);
 
-        return schemaManager.ensureIndexExists(indexName, request.getDocument())
-                .onItem().transform(v -> documentConverter.prepareBulkRequest(request.getDocument(), indexName))
-                .onItem().transformToUni(openSearchRepository::bulk)
-                .onItem().transform(bulkResponse -> {
-                    if (bulkResponse.getErrors()) {
-                        String errDetail = bulkResponse.getItemsList().stream()
-                                .filter(i -> (i.hasIndex() && i.getIndex().hasError()) || (i.hasCreate() && i.getCreate().hasError()))
-                                .map(i -> {
-                                    if (i.hasIndex() && i.getIndex().hasError()) {
-                                        var e = i.getIndex().getError();
-                                        return e.getType() + ": " + e.getReason();
-                                    }
-                                    if (i.hasCreate() && i.getCreate().hasError()) {
-                                        var e = i.getCreate().getError();
-                                        return e.getType() + ": " + e.getReason();
-                                    }
-                                    return "unknown";
-                                })
-                                .findFirst()
-                                .orElse("unknown");
-                        LOG.warnf("Bulk gRPC request had errors for document %s: %s", request.getDocument().getDocId(), errDetail);
-                        return buildResponse(request, false, "Bulk operation completed with errors: " + errDetail);
-                    } else {
-                        LOG.infof("Successfully indexed document %s", request.getDocument().getDocId());
-                        return buildResponse(request, true, "Document indexed successfully.");
-                    }
+        return schemaManager.indexDocumentViaManager(indexName, request.getDocument())
+                .onItem().transform(v -> {
+                    LOG.infof("Successfully indexed document %s via manager", request.getDocument().getDocId());
+                    return buildResponse(request, true, "Document indexed successfully via manager.");
                 })
-                .onFailure().recoverWithItem(error -> {
-                    LOG.errorf(error, "Failed to process document %s", request.getDocument().getDocId());
-                    return buildResponse(request, false, "Processing failed: " + error.getMessage());
+                .onFailure().recoverWithUni(error -> {
+                    LOG.errorf(error, "Failed to process document %s via manager", request.getDocument().getDocId());
+                    return Uni.createFrom().item(buildResponse(request, false, "Processing failed: " + error.getMessage()));
                 });
     }
 
@@ -106,7 +70,6 @@ public class OpenSearchIngestionServiceImpl
                 .build();
     }
 
-    // PipeStepProcessorService interface implementation
     @RunOnVirtualThread
     @Override
     public Uni<ProcessDataResponse> processData(ProcessDataRequest request) {
@@ -146,7 +109,7 @@ public class OpenSearchIngestionServiceImpl
                 .setModuleName("opensearch-sink")
                 .setVersion("1.0.0-SNAPSHOT")
                 .setDisplayName("OpenSearch Sink")
-                .setDescription("OpenSearch vector indexing sink with dynamic schema creation and distributed locking")
+                .setDescription("OpenSearch vector indexing sink with organic schema management via opensearch-manager")
                 .addTags("opensearch")
                 .addTags("sink")
                 .addTags("vector")

@@ -8,6 +8,7 @@ import ai.pipestream.data.v1.SemanticChunk;
 import ai.pipestream.data.v1.SemanticProcessingResult;
 import ai.pipestream.opensearch.v1.OpenSearchEmbedding;
 import ai.pipestream.opensearch.v1.OpenSearchDocument;
+import ai.pipestream.opensearch.v1.SemanticVectorSet;
 import jakarta.enterprise.context.ApplicationScoped;
 import org.jboss.logging.Logger;
 import org.opensearch.protobufs.BulkRequest;
@@ -52,7 +53,7 @@ public class DocumentConverterService {
         }
     }
 
-    private OpenSearchDocument convertToOpenSearchDocument(PipeDoc document) {
+    public OpenSearchDocument convertToOpenSearchDocument(PipeDoc document) {
         // Use last_modified_date for created_at if available, otherwise use current time
         Timestamp createdAt = document.getSearchMetadata().hasCreationDate() 
             ? document.getSearchMetadata().getCreationDate()
@@ -83,14 +84,9 @@ public class DocumentConverterService {
         if (document.getSearchMetadata().hasKeywords() && document.getSearchMetadata().getKeywords().getKeywordCount() > 0) {
             builder.addAllTags(document.getSearchMetadata().getKeywords().getKeywordList());
         }
-        // Revision ID not available in current PipeDoc structure
-        // if (document.hasRevisionId()) {
-        //     builder.setRevisionId(document.getRevisionId());
-        // }
 
         // Convert all embeddings to nested structure
-        List<OpenSearchEmbedding> embeddings = extractAllEmbeddings(document);
-        builder.addAllEmbeddings(embeddings);
+        populateSemanticSets(document, builder);
 
         // Handle custom fields if present
         if (document.getSearchMetadata().hasCustomFields()) {
@@ -100,25 +96,34 @@ public class DocumentConverterService {
         return builder.build();
     }
 
-    private List<OpenSearchEmbedding> extractAllEmbeddings(PipeDoc document) {
-        List<OpenSearchEmbedding> embeddings = new ArrayList<>();
-        
-        // Deduplicate embeddings by composite key (chunk_config_id + embedding_id + source_text)
-        Map<String, OpenSearchEmbedding> embeddingMap = new HashMap<>();
-
+    private void populateSemanticSets(PipeDoc document, OpenSearchDocument.Builder builder) {
         for (SemanticProcessingResult result : document.getSearchMetadata().getSemanticResultsList()) {
             String chunkConfigId = result.getChunkConfigId();
             String embeddingId = result.getEmbeddingConfigId();
-            
+            String sourceFieldName = result.getSourceFieldName();
+
+            if (chunkConfigId == null || chunkConfigId.isEmpty() || 
+                embeddingId == null || embeddingId.isEmpty()) {
+                continue;
+            }
+
+            SemanticVectorSet.Builder setBuilder = SemanticVectorSet.newBuilder()
+                    .setSourceFieldName(sourceFieldName != null ? sourceFieldName : "unknown")
+                    .setChunkConfigId(chunkConfigId)
+                    .setEmbeddingId(embeddingId);
+
+            // Deduplicate embeddings within this set by source_text
+            Map<Integer, OpenSearchEmbedding> embeddingMap = new HashMap<>();
+
             for (SemanticChunk chunk : result.getChunksList()) {
                 if (!chunk.hasEmbeddingInfo() || chunk.getEmbeddingInfo().getVectorCount() == 0) {
                     continue;
                 }
 
                 String sourceText = chunk.getEmbeddingInfo().getTextContent();
-                String compositeKey = chunkConfigId + "|" + embeddingId + "|" + sourceText.hashCode();
+                int textHash = sourceText.hashCode();
                 
-                if (!embeddingMap.containsKey(compositeKey)) {
+                if (!embeddingMap.containsKey(textHash)) {
                     OpenSearchEmbedding.Builder embeddingBuilder = OpenSearchEmbedding.newBuilder()
                             .addAllVector(chunk.getEmbeddingInfo().getVectorList())
                             .setSourceText(sourceText)
@@ -126,18 +131,15 @@ public class DocumentConverterService {
                             .setEmbeddingId(embeddingId)
                             .setIsPrimary(isPrimaryEmbedding(chunk, result));
 
-                    // Add context text if available
-                    // Context text not available in current ChunkEmbedding structure
-                    // if (chunk.getEmbeddingInfo().getContextTextCount() > 0) {
-                    //     embeddingBuilder.addAllContextText(chunk.getEmbeddingInfo().getContextTextList());
-                    // }
-
-                    embeddingMap.put(compositeKey, embeddingBuilder.build());
+                    embeddingMap.put(textHash, embeddingBuilder.build());
                 }
             }
-        }
 
-        return new ArrayList<>(embeddingMap.values());
+            if (!embeddingMap.isEmpty()) {
+                setBuilder.addAllEmbeddings(embeddingMap.values());
+                builder.addSemanticSets(setBuilder.build());
+            }
+        }
     }
 
     private boolean isPrimaryEmbedding(SemanticChunk chunk, SemanticProcessingResult result) {
