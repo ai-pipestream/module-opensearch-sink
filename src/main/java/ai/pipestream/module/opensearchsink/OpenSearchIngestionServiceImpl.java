@@ -51,7 +51,7 @@ public class OpenSearchIngestionServiceImpl extends MutinyOpenSearchIngestionSer
     @Override
     public Multi<StreamDocumentsResponse> streamDocuments(Multi<StreamDocumentsRequest> requestStream) {
         // NOTE: StreamDocumentsRequest currently lacks a config field in the proto.
-        // For now, we fall back to default behavior for streaming path.
+        // We fall back to legacy behavior (document type inference) for the streaming path.
         return requestStream.onItem().transformToUniAndMerge(req -> processSingleRequest(req, Optional.empty()));
     }
 
@@ -60,13 +60,9 @@ public class OpenSearchIngestionServiceImpl extends MutinyOpenSearchIngestionSer
             return Uni.createFrom().item(buildResponse(request, false, "StreamDocumentsRequest has no document."));
         }
 
-        // Use index name from options if provided, otherwise fail early
-        if (options.isEmpty() || options.get().indexName() == null || options.get().indexName().isBlank()) {
-            LOG.errorf("Failed to process document %s: Missing target index name in request configuration", request.getDocument().getDocId());
-            return Uni.createFrom().item(buildResponse(request, false, "Missing target index name in request configuration"));
-        }
-
-        String indexName = options.get().indexName();
+        // Use index name from Engine options if provided, otherwise fallback to document type inference
+        String indexName = options.map(OpenSearchSinkOptions::indexName)
+                .orElseGet(() -> schemaManager.determineIndexName(request.getDocument().getSearchMetadata().getDocumentType()));
 
         return schemaManager.indexDocumentViaManager(indexName, request.getDocument(), options)
                 .onItem().transform(managerMessage -> {
@@ -100,7 +96,7 @@ public class OpenSearchIngestionServiceImpl extends MutinyOpenSearchIngestionSer
                 .build());
         }
 
-        // 1. Extract and parse JSON configuration provided by the engine
+        // 1. Extract and parse JSON configuration provided by the Engine
         Optional<OpenSearchSinkOptions> options = Optional.empty();
         if (request.hasConfig() && request.getConfig().hasJsonConfig()) {
             try {

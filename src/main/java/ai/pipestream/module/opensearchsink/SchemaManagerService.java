@@ -30,10 +30,26 @@ public class SchemaManagerService {
     MutinyOpenSearchManagerServiceGrpc.MutinyOpenSearchManagerServiceStub openSearchManagerClient;
 
     /**
+     * Determines the index name for a given document type.
+     * Uses a simple naming convention: "pipeline-{documentType}"
+     * <p>
+     * Note: Used as a fallback when no Engine configuration is provided (e.g. legacy streaming path).
+     *
+     * @param documentType The document type (e.g., "article", "test-doc")
+     * @return The index name
+     */
+    public String determineIndexName(String documentType) {
+        if (documentType == null || documentType.isEmpty()) {
+            return "pipeline-documents";
+        }
+        return "pipeline-" + documentType.toLowerCase();
+    }
+
+    /**
      * Proxies the indexing request to the OpenSearch Manager, which handles
      * both schema provisioning (organic registration) and the actual indexing.
      * 
-     * @param indexName The exact target index name (provided by Engine config)
+     * @param indexName The target index name
      * @param document The document to index
      * @param options Optional request-time Sink configuration (includes instance routing)
      * @return The message from the manager response
