@@ -122,8 +122,8 @@ Build a JVM image
 
 Run the container
 - docker run --rm \
-    -e QUARKUS_HTTP_PORT=39004 \
-    -p 39004:39004 \
+    -e QUARKUS_HTTP_PORT=19004 \
+    -p 19004:19004 \
     --name opensearch-sink \
     opensearch-sink:local
 
