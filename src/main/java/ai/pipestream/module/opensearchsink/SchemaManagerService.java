@@ -85,4 +85,12 @@ public class SchemaManagerService {
                     }
                 });
     }
+
+    /**
+     * Proxies a stream of indexing requests to the OpenSearch Manager for high-throughput bulk ingestion.
+     */
+    public io.smallrye.mutiny.Multi<ai.pipestream.opensearch.v1.StreamIndexDocumentsResponse> streamIndexDocumentsViaManager(
+            io.smallrye.mutiny.Multi<ai.pipestream.opensearch.v1.StreamIndexDocumentsRequest> requests) {
+        return openSearchManagerClient.streamIndexDocuments(requests);
+    }
 }

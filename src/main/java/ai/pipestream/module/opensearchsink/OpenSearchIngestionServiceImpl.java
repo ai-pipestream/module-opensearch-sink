@@ -39,6 +39,9 @@ public class OpenSearchIngestionServiceImpl extends MutinyOpenSearchIngestionSer
     SchemaManagerService schemaManager;
 
     @Inject
+    ai.pipestream.module.opensearchsink.service.DocumentConverterService documentConverter;
+
+    @Inject
     SchemaExtractorService schemaExtractorService;
 
     @Inject
@@ -50,9 +53,47 @@ public class OpenSearchIngestionServiceImpl extends MutinyOpenSearchIngestionSer
 
     @Override
     public Multi<StreamDocumentsResponse> streamDocuments(Multi<StreamDocumentsRequest> requestStream) {
-        // NOTE: StreamDocumentsRequest currently lacks a config field in the proto.
-        // We fall back to legacy behavior (document type inference) for the streaming path.
-        return requestStream.onItem().transformToUniAndMerge(req -> processSingleRequest(req, Optional.empty()));
+        LOG.info("StreamDocuments called for OpenSearch sink module");
+        // High-throughput path: stream directly to manager
+        Multi<ai.pipestream.opensearch.v1.StreamIndexDocumentsRequest> managerRequests = requestStream.onItem().transform(req -> {
+            try {
+                String documentType = req.getDocument().getSearchMetadata().getDocumentType();
+                String indexName = schemaManager.determineIndexName(documentType);
+                
+                LOG.debugf("Streaming document %s to manager for index %s", req.getDocument().getDocId(), indexName);
+                
+                ai.pipestream.opensearch.v1.OpenSearchDocument osDoc = documentConverter.convertToOpenSearchDocument(req.getDocument());
+                
+                var builder = ai.pipestream.opensearch.v1.StreamIndexDocumentsRequest.newBuilder()
+                        .setRequestId(req.getRequestId())
+                        .setIndexName(indexName)
+                        .setDocument(osDoc)
+                        .setDocumentId(req.getDocument().getDocId());
+                
+                if (req.getDocument().hasOwnership()) {
+                    builder.setAccountId(req.getDocument().getOwnership().getAccountId());
+                    builder.setDatasourceId(req.getDocument().getOwnership().getDatasourceId());
+                }
+                
+                return builder.build();
+            } catch (Exception e) {
+                LOG.error("Failed to transform StreamDocumentsRequest for manager", e);
+                throw e;
+            }
+        });
+
+        return schemaManager.streamIndexDocumentsViaManager(managerRequests)
+                .onItem().transform(resp -> {
+                    LOG.debugf("Received streaming response from manager for req: %s, success: %b", resp.getRequestId(), resp.getSuccess());
+                    String message = resp.getSuccess() ? resp.getMessage() : "Indexing failed: " + resp.getMessage();
+                    return StreamDocumentsResponse.newBuilder()
+                        .setRequestId(resp.getRequestId())
+                        .setDocumentId(resp.getDocumentId())
+                        .setSuccess(resp.getSuccess())
+                        .setMessage(message)
+                        .build();
+                })
+                .onFailure().invoke(t -> LOG.error("Stream to manager failed", t));
     }
 
     private Uni<StreamDocumentsResponse> processSingleRequest(StreamDocumentsRequest request, Optional<OpenSearchSinkOptions> options) {
