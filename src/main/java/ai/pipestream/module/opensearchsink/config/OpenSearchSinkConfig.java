@@ -1,21 +1,12 @@
 package ai.pipestream.module.opensearchsink.config;
 
 import io.smallrye.config.ConfigMapping;
-import io.smallrye.config.WithDefault;
 
 /**
- * Operational defaults for the OpenSearch sink.
- * These are application-level defaults; per-node config comes from OpenSearchSinkOptions via JSONForms.
+ * JVM-level operational configuration for the OpenSearch sink.
+ * This is currently empty as all business logic is managed via JSONForms (OpenSearchSinkOptions).
  */
-@ConfigMapping(prefix = "sink")
+@ConfigMapping(prefix = "opensearch.sink")
 public interface OpenSearchSinkConfig {
-
-    @WithDefault("documents")
-    String indexPrefix();
-
-    @WithDefault("opensearch-cluster")
-    String clusterName();
-
-    @WithDefault("default-pipeline")
-    String pipelineName();
+    // Intentionally empty. Add technical JVM settings here if needed (e.g., global timeouts).
 }

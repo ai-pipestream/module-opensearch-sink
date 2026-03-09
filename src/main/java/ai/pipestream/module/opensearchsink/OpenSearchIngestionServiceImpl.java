@@ -8,17 +8,21 @@ import ai.pipestream.data.module.v1.ProcessDataRequest;
 import ai.pipestream.data.module.v1.ProcessDataResponse;
 import ai.pipestream.data.module.v1.GetServiceRegistrationRequest;
 import ai.pipestream.data.module.v1.GetServiceRegistrationResponse;
+import ai.pipestream.module.opensearchsink.config.OpenSearchSinkOptions;
 import ai.pipestream.module.opensearchsink.schema.SchemaExtractorService;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.google.protobuf.util.JsonFormat;
 import io.quarkus.grpc.GrpcService;
 import io.quarkus.runtime.annotations.RegisterForReflection;
 import io.smallrye.mutiny.Multi;
 import io.smallrye.mutiny.Uni;
-import io.quarkus.vertx.ConsumeEvent;
 import io.quarkus.runtime.StartupEvent;
 import jakarta.enterprise.event.Observes;
 import jakarta.inject.Inject;
 import jakarta.inject.Singleton;
 import org.jboss.logging.Logger;
+
+import java.util.Optional;
 
 /**
  * gRPC service implementation for the OpenSearch sink.
@@ -37,27 +41,36 @@ public class OpenSearchIngestionServiceImpl extends MutinyOpenSearchIngestionSer
     @Inject
     SchemaExtractorService schemaExtractorService;
 
+    @Inject
+    ObjectMapper objectMapper;
+
     void onStart(@Observes StartupEvent ev) {
         LOG.info("OpenSearch Ingestion Service starting...");
     }
 
     @Override
     public Multi<StreamDocumentsResponse> streamDocuments(Multi<StreamDocumentsRequest> requestStream) {
-        return requestStream.onItem().transformToUniAndMerge(this::processSingleRequest);
+        // NOTE: StreamDocumentsRequest currently lacks a config field in the proto.
+        // For now, we fall back to default behavior for streaming path.
+        return requestStream.onItem().transformToUniAndMerge(req -> processSingleRequest(req, Optional.empty()));
     }
 
-    private Uni<StreamDocumentsResponse> processSingleRequest(StreamDocumentsRequest request) {
+    private Uni<StreamDocumentsResponse> processSingleRequest(StreamDocumentsRequest request, Optional<OpenSearchSinkOptions> options) {
         if (!request.hasDocument()) {
             return Uni.createFrom().item(buildResponse(request, false, "StreamDocumentsRequest has no document."));
         }
 
-        // Extract document type from PipeDoc.search_metadata
-        String documentType = request.getDocument().getSearchMetadata().getDocumentType();
-        String indexName = schemaManager.determineIndexName(documentType);
+        // Use index name from options if provided, otherwise fail early
+        if (options.isEmpty() || options.get().indexName() == null || options.get().indexName().isBlank()) {
+            LOG.errorf("Failed to process document %s: Missing target index name in request configuration", request.getDocument().getDocId());
+            return Uni.createFrom().item(buildResponse(request, false, "Missing target index name in request configuration"));
+        }
 
-        return schemaManager.indexDocumentViaManager(indexName, request.getDocument())
+        String indexName = options.get().indexName();
+
+        return schemaManager.indexDocumentViaManager(indexName, request.getDocument(), options)
                 .onItem().transform(managerMessage -> {
-                    LOG.infof("Successfully indexed document %s via manager", request.getDocument().getDocId());
+                    LOG.infof("Successfully indexed document %s into %s via manager", request.getDocument().getDocId(), indexName);
                     return buildResponse(request, true, managerMessage);
                 })
                 .onFailure().recoverWithUni(error -> {
@@ -87,13 +100,29 @@ public class OpenSearchIngestionServiceImpl extends MutinyOpenSearchIngestionSer
                 .build());
         }
 
-        // Convert to ingestion request and process
+        // 1. Extract and parse JSON configuration provided by the engine
+        Optional<OpenSearchSinkOptions> options = Optional.empty();
+        if (request.hasConfig() && request.getConfig().hasJsonConfig()) {
+            try {
+                String json = JsonFormat.printer().print(request.getConfig().getJsonConfig());
+                options = Optional.of(objectMapper.readValue(json, OpenSearchSinkOptions.class));
+                LOG.debugf("Parsed request configuration for index: %s", options.get().indexName());
+            } catch (Exception e) {
+                LOG.error("Failed to parse Sink configuration from request", e);
+                return Uni.createFrom().item(ProcessDataResponse.newBuilder()
+                        .setSuccess(false)
+                        .addProcessorLogs("Invalid configuration: " + e.getMessage())
+                        .build());
+            }
+        }
+
+        // 2. Convert to ingestion request and process with options
         StreamDocumentsRequest streamRequest = StreamDocumentsRequest.newBuilder()
             .setRequestId(java.util.UUID.randomUUID().toString())
             .setDocument(request.getDocument())
             .build();
 
-        return processSingleRequest(streamRequest)
+        return processSingleRequest(streamRequest, options)
             .map(streamResponse -> ProcessDataResponse.newBuilder()
                 .setSuccess(streamResponse.getSuccess())
                 .addProcessorLogs(streamResponse.getMessage())

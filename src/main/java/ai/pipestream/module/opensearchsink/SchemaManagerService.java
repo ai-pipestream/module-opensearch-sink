@@ -4,12 +4,15 @@ import ai.pipestream.data.v1.PipeDoc;
 import ai.pipestream.opensearch.v1.IndexDocumentRequest;
 import ai.pipestream.opensearch.v1.OpenSearchDocument;
 import ai.pipestream.opensearch.v1.MutinyOpenSearchManagerServiceGrpc;
+import ai.pipestream.module.opensearchsink.config.OpenSearchSinkOptions;
 import ai.pipestream.module.opensearchsink.service.DocumentConverterService;
 import io.quarkus.grpc.GrpcClient;
 import io.smallrye.mutiny.Uni;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
+
+import java.util.Optional;
 
 /**
  * Service responsible for managing OpenSearch index schemas via the OpenSearch Manager.
@@ -27,34 +30,30 @@ public class SchemaManagerService {
     MutinyOpenSearchManagerServiceGrpc.MutinyOpenSearchManagerServiceStub openSearchManagerClient;
 
     /**
-     * Determines the index name for a given document type.
-     * Uses a simple naming convention: "pipeline-{documentType}"
-     * <p>
-     * Note: In the future, the index name will come from OpenSearchSinkOptions.indexName()
-     * in the node config, making this a fallback for backwards compatibility.
-     *
-     * @param documentType The document type (e.g., "article", "test-doc")
-     * @return The index name
-     */
-    public String determineIndexName(String documentType) {
-        if (documentType == null || documentType.isEmpty()) {
-            return "pipeline-documents";
-        }
-        return "pipeline-" + documentType.toLowerCase();
-    }
-
-    /**
      * Proxies the indexing request to the OpenSearch Manager, which handles
      * both schema provisioning (organic registration) and the actual indexing.
-     * Returns the message from the manager response.
+     * 
+     * @param indexName The exact target index name (provided by Engine config)
+     * @param document The document to index
+     * @param options Optional request-time Sink configuration (includes instance routing)
+     * @return The message from the manager response
      */
-    public Uni<String> indexDocumentViaManager(String indexName, PipeDoc document) {
+    public Uni<String> indexDocumentViaManager(String indexName, PipeDoc document, Optional<OpenSearchSinkOptions> options) {
         OpenSearchDocument osDoc = documentConverter.convertToOpenSearchDocument(document);
 
         IndexDocumentRequest.Builder requestBuilder = IndexDocumentRequest.newBuilder()
                 .setIndexName(indexName)
                 .setDocument(osDoc)
                 .setDocumentId(document.getDocId());
+
+        // Use opensearch_instance from options if provided
+        options.ifPresent(opt -> {
+            if (opt.opensearchInstance() != null && !opt.opensearchInstance().isBlank()) {
+                // In a real multi-tenant environment, we would use this to select the gRPC client or 
+                // add it to the request metadata for the manager to route.
+                LOG.debugf("Target OpenSearch instance requested: %s", opt.opensearchInstance());
+            }
+        });
 
         if (document.hasOwnership()) {
             requestBuilder.setAccountId(document.getOwnership().getAccountId());

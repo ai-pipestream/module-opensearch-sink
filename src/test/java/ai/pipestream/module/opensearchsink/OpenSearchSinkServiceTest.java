@@ -1,5 +1,10 @@
 package ai.pipestream.module.opensearchsink;
 
+import ai.pipestream.data.v1.ProcessConfiguration;
+import ai.pipestream.data.module.v1.ProcessDataRequest;
+import ai.pipestream.data.module.v1.ProcessDataResponse;
+import com.google.protobuf.Struct;
+import com.google.protobuf.Value;
 import com.google.protobuf.Timestamp;
 import ai.pipestream.data.v1.*;
 import ai.pipestream.ingestion.v1.StreamDocumentsRequest;
@@ -26,12 +31,12 @@ public class OpenSearchSinkServiceTest {
     MutinyOpenSearchIngestionServiceGrpc.MutinyOpenSearchIngestionServiceStub ingestionClient;
 
     @Inject
-    SchemaManagerService schemaManager;
+    @io.quarkus.grpc.GrpcService
+    OpenSearchIngestionServiceImpl processorService;
 
     @Test
-    void testStreamDocuments_Success_ContractValidation() {
-        // This test verifies that the Sink correctly formats and sends documents to the platform.
-        // It relies on the High-Fidelity WireMock which validates the Protobuf contract.
+    void testStreamDocuments_MissingConfig_FailsEarly() {
+        // Without config, the streaming path should fail early indicating missing index name
         long now = System.currentTimeMillis() / 1000;
         PipeDoc testDoc = createTestDoc("doc-123", "test-doc", now);
 
@@ -44,49 +49,57 @@ public class OpenSearchSinkServiceTest {
                 .collect().asList().await().indefinitely();
 
         assertEquals(1, responses.size());
-        assertTrue(responses.get(0).getSuccess());
-        // Verify we got the expected message from our High-Fidelity mock
-        assertTrue(responses.get(0).getMessage().contains("WireMock"));
+        assertFalse(responses.get(0).getSuccess());
+        assertTrue(responses.get(0).getMessage().contains("Missing target index name"));
     }
 
     @Test
-    void testStreamDocuments_MultipleSemanticSets_ContractValidation() {
-        PipeDoc testDoc = PipeDoc.newBuilder()
-                .setDocId("doc-multi-set")
-                .setSearchMetadata(SearchMetadata.newBuilder()
-                        .setDocumentType("complex-doc")
-                        .addSemanticResults(createSemanticResult("body", "chunker-1", "embed-1"))
-                        .addSemanticResults(createSemanticResult("summary", "chunker-2", "embed-2"))
+    void testProcessData_CustomConfig_RoutingToSpecificIndex() {
+        // This test simulates the engine passing a custom JSON configuration
+        long now = System.currentTimeMillis() / 1000;
+        PipeDoc testDoc = createTestDoc("doc-custom-cfg", "any-type", now);
+
+        // Build the Struct that JSONForms would produce
+        Struct jsonConfig = Struct.newBuilder()
+                .putFields("opensearch_instance", Value.newBuilder().setStringValue("prod-cluster").build())
+                .putFields("index_name", Value.newBuilder().setStringValue("manual-override-index").build())
+                .putFields("indexing_strategy", Value.newBuilder().setStringValue("NESTED").build())
+                .build();
+
+        ProcessDataRequest request = ProcessDataRequest.newBuilder()
+                .setDocument(testDoc)
+                .setConfig(ProcessConfiguration.newBuilder()
+                        .setJsonConfig(jsonConfig)
                         .build())
                 .build();
 
-        StreamDocumentsRequest request = StreamDocumentsRequest.newBuilder()
-                .setDocument(testDoc)
-                .setRequestId(UUID.randomUUID().toString())
-                .build();
+        ProcessDataResponse response = processorService.processData(request).await().indefinitely();
 
-        List<StreamDocumentsResponse> responses = ingestionClient.streamDocuments(Multi.createFrom().item(request))
-                .collect().asList().await().indefinitely();
-
-        assertTrue(responses.get(0).getSuccess());
+        assertTrue(response.getSuccess());
+        // Verify we got the success message from the mock (which means validation passed)
+        assertTrue(response.getProcessorLogs(0).contains("WireMock"));
     }
 
     @Test
-    void testStreamDocuments_ForcedInternalError() {
+    void testProcessData_ForcedInternalError() {
         // Trigger error by using the "fail-this-index" trigger which our high-fidelity mock recognizes
-        PipeDoc testDoc = createTestDoc("doc-fail", "fail-this-index", System.currentTimeMillis() / 1000);
+        PipeDoc testDoc = createTestDoc("doc-fail", "any-type", System.currentTimeMillis() / 1000);
 
-        StreamDocumentsRequest request = StreamDocumentsRequest.newBuilder()
-                .setDocument(testDoc)
-                .setRequestId(UUID.randomUUID().toString())
+        Struct jsonConfig = Struct.newBuilder()
+                .putFields("index_name", Value.newBuilder().setStringValue("fail-this-index").build())
                 .build();
 
-        List<StreamDocumentsResponse> responses = ingestionClient.streamDocuments(Multi.createFrom().item(request))
-                .collect().asList().await().indefinitely();
+        ProcessDataRequest request = ProcessDataRequest.newBuilder()
+                .setDocument(testDoc)
+                .setConfig(ProcessConfiguration.newBuilder()
+                        .setJsonConfig(jsonConfig)
+                        .build())
+                .build();
 
-        assertEquals(1, responses.size());
-        assertFalse(responses.get(0).getSuccess());
-        assertTrue(responses.get(0).getMessage().contains("Indexing failed"));
+        ProcessDataResponse response = processorService.processData(request).await().indefinitely();
+
+        assertFalse(response.getSuccess());
+        assertTrue(response.getProcessorLogs(0).contains("Forced internal error"));
     }
 
     private PipeDoc createTestDoc(String docId, String docType, long timestamp) {
