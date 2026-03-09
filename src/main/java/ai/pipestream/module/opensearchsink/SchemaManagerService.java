@@ -1,7 +1,6 @@
 package ai.pipestream.module.opensearchsink;
 
 import ai.pipestream.data.v1.PipeDoc;
-import ai.pipestream.module.opensearchsink.config.OpenSearchSinkConfig;
 import ai.pipestream.opensearch.v1.IndexDocumentRequest;
 import ai.pipestream.opensearch.v1.OpenSearchDocument;
 import ai.pipestream.opensearch.v1.MutinyOpenSearchManagerServiceGrpc;
@@ -22,21 +21,17 @@ public class SchemaManagerService {
     private static final Logger LOG = Logger.getLogger(SchemaManagerService.class);
 
     @Inject
-    OpenSearchSinkConfig openSearchSinkConfig;
-
-    @Inject
     DocumentConverterService documentConverter;
 
     @GrpcClient("opensearch-manager")
     MutinyOpenSearchManagerServiceGrpc.MutinyOpenSearchManagerServiceStub openSearchManagerClient;
 
-    boolean useOpenSearchManager() {
-        return openSearchSinkConfig.useOpensearchManager();
-    }
-
     /**
      * Determines the index name for a given document type.
      * Uses a simple naming convention: "pipeline-{documentType}"
+     * <p>
+     * Note: In the future, the index name will come from OpenSearchSinkOptions.indexName()
+     * in the node config, making this a fallback for backwards compatibility.
      *
      * @param documentType The document type (e.g., "article", "test-doc")
      * @return The index name
@@ -49,16 +44,13 @@ public class SchemaManagerService {
     }
 
     /**
-     * Proxies the indexing request to the OpenSearch Manager, which handles 
+     * Proxies the indexing request to the OpenSearch Manager, which handles
      * both schema provisioning (organic registration) and the actual indexing.
+     * Returns the message from the manager response.
      */
-    public Uni<Void> indexDocumentViaManager(String indexName, PipeDoc document) {
-        if (!useOpenSearchManager()) {
-            return Uni.createFrom().failure(new IllegalStateException("opensearch-manager is required for this architecture"));
-        }
-
+    public Uni<String> indexDocumentViaManager(String indexName, PipeDoc document) {
         OpenSearchDocument osDoc = documentConverter.convertToOpenSearchDocument(document);
-        
+
         IndexDocumentRequest.Builder requestBuilder = IndexDocumentRequest.newBuilder()
                 .setIndexName(indexName)
                 .setDocument(osDoc)
@@ -72,9 +64,9 @@ public class SchemaManagerService {
         return openSearchManagerClient.indexDocument(requestBuilder.build())
                 .onItem().transformToUni(resp -> {
                     if (resp.getSuccess()) {
-                        return Uni.createFrom().voidItem();
+                        return Uni.createFrom().item(resp.getMessage());
                     } else {
-                        return Uni.createFrom().failure(new RuntimeException("Indexing failed: " + resp.getMessage()));
+                        return Uni.createFrom().failure(new RuntimeException(resp.getMessage()));
                     }
                 });
     }

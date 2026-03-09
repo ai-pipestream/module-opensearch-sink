@@ -3,36 +3,42 @@ package ai.pipestream.module.opensearchsink;
 import ai.pipestream.ingestion.v1.MutinyOpenSearchIngestionServiceGrpc;
 import ai.pipestream.ingestion.v1.StreamDocumentsRequest;
 import ai.pipestream.ingestion.v1.StreamDocumentsResponse;
-import ai.pipestream.data.module.v1.*;
+import ai.pipestream.data.module.v1.PipeStepProcessorService;
+import ai.pipestream.data.module.v1.ProcessDataRequest;
+import ai.pipestream.data.module.v1.ProcessDataResponse;
+import ai.pipestream.data.module.v1.GetServiceRegistrationRequest;
+import ai.pipestream.data.module.v1.GetServiceRegistrationResponse;
 import ai.pipestream.module.opensearchsink.schema.SchemaExtractorService;
-import ai.pipestream.module.opensearchsink.service.DocumentConverterService;
 import io.quarkus.grpc.GrpcService;
-import io.smallrye.common.annotation.RunOnVirtualThread;
+import io.quarkus.runtime.annotations.RegisterForReflection;
 import io.smallrye.mutiny.Multi;
 import io.smallrye.mutiny.Uni;
+import io.quarkus.vertx.ConsumeEvent;
+import io.quarkus.runtime.StartupEvent;
+import jakarta.enterprise.event.Observes;
 import jakarta.inject.Inject;
+import jakarta.inject.Singleton;
 import org.jboss.logging.Logger;
 
 /**
- * The canonical OpenSearch ingestion service and PipeStepProcessor implementation.
- * This service delegates all indexing and schema management to the OpenSearch Manager.
+ * gRPC service implementation for the OpenSearch sink.
+ * Handles both the ingestion stream and standard pipeline step processing.
  */
+@Singleton
 @GrpcService
-public class OpenSearchIngestionServiceImpl
-        extends MutinyOpenSearchIngestionServiceGrpc.OpenSearchIngestionServiceImplBase
-        implements PipeStepProcessorService {
+@RegisterForReflection
+public class OpenSearchIngestionServiceImpl extends MutinyOpenSearchIngestionServiceGrpc.OpenSearchIngestionServiceImplBase implements PipeStepProcessorService {
 
     private static final Logger LOG = Logger.getLogger(OpenSearchIngestionServiceImpl.class);
 
-    private final SchemaManagerService schemaManager;
-    private final SchemaExtractorService schemaExtractorService;
+    @Inject
+    SchemaManagerService schemaManager;
 
     @Inject
-    public OpenSearchIngestionServiceImpl(
-            SchemaManagerService schemaManager,
-            SchemaExtractorService schemaExtractorService) {
-        this.schemaManager = schemaManager;
-        this.schemaExtractorService = schemaExtractorService;
+    SchemaExtractorService schemaExtractorService;
+
+    void onStart(@Observes StartupEvent ev) {
+        LOG.info("OpenSearch Ingestion Service starting...");
     }
 
     @Override
@@ -50,13 +56,13 @@ public class OpenSearchIngestionServiceImpl
         String indexName = schemaManager.determineIndexName(documentType);
 
         return schemaManager.indexDocumentViaManager(indexName, request.getDocument())
-                .onItem().transform(v -> {
+                .onItem().transform(managerMessage -> {
                     LOG.infof("Successfully indexed document %s via manager", request.getDocument().getDocId());
-                    return buildResponse(request, true, "Document indexed successfully via manager.");
+                    return buildResponse(request, true, managerMessage);
                 })
                 .onFailure().recoverWithUni(error -> {
                     LOG.errorf(error, "Failed to process document %s via manager", request.getDocument().getDocId());
-                    return Uni.createFrom().item(buildResponse(request, false, "Processing failed: " + error.getMessage()));
+                    return Uni.createFrom().item(buildResponse(request, false, "Indexing failed: " + error.getMessage()));
                 });
     }
 
@@ -70,7 +76,6 @@ public class OpenSearchIngestionServiceImpl
                 .build();
     }
 
-    @RunOnVirtualThread
     @Override
     public Uni<ProcessDataResponse> processData(ProcessDataRequest request) {
         LOG.info("ProcessData called for OpenSearch sink module");
@@ -96,26 +101,15 @@ public class OpenSearchIngestionServiceImpl
                 .build());
     }
 
-    @RunOnVirtualThread
     @Override
     public Uni<GetServiceRegistrationResponse> getServiceRegistration(GetServiceRegistrationRequest request) {
-        LOG.info("OpenSearch sink service registration requested");
-
-        Capabilities capabilities = Capabilities.newBuilder()
-                .addTypes(CapabilityType.CAPABILITY_TYPE_SINK)
-                .build();
+        LOG.info("GetServiceRegistration called for OpenSearch sink module");
 
         GetServiceRegistrationResponse.Builder responseBuilder = GetServiceRegistrationResponse.newBuilder()
                 .setModuleName("opensearch-sink")
-                .setVersion("1.0.0-SNAPSHOT")
+                .setVersion("0.1.2-SNAPSHOT")
                 .setDisplayName("OpenSearch Sink")
-                .setDescription("OpenSearch vector indexing sink with organic schema management via opensearch-manager")
-                .addTags("opensearch")
-                .addTags("sink")
-                .addTags("vector")
-                .addTags("indexing")
-                .addTags("module")
-                .setCapabilities(capabilities)
+                .setDescription("OpenSearch vector indexing sink with organic schema management")
                 .setHealthCheckPassed(true)
                 .setHealthCheckMessage("OpenSearch sink module is healthy");
 
