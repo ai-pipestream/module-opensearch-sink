@@ -22,6 +22,10 @@ import jakarta.inject.Inject;
 import jakarta.inject.Singleton;
 import org.jboss.logging.Logger;
 
+import ai.pipestream.module.opensearchsink.service.ConversionResult;
+
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Optional;
 
 /**
@@ -128,6 +132,8 @@ public class OpenSearchIngestionServiceImpl extends MutinyOpenSearchIngestionSer
 
     @Override
     public Uni<ProcessDataResponse> processData(ProcessDataRequest request) {
+        long startTime = System.currentTimeMillis();
+        List<String> auditLogs = new ArrayList<>();
         LOG.info("ProcessData called for OpenSearch sink module");
 
         if (!request.hasDocument()) {
@@ -136,6 +142,8 @@ public class OpenSearchIngestionServiceImpl extends MutinyOpenSearchIngestionSer
                 .addProcessorLogs("No document provided in request")
                 .build());
         }
+
+        String docId = request.getDocument().getDocId();
 
         // 1. Extract and parse JSON configuration provided by the Engine
         Optional<OpenSearchSinkOptions> options = Optional.empty();
@@ -153,18 +161,36 @@ public class OpenSearchIngestionServiceImpl extends MutinyOpenSearchIngestionSer
             }
         }
 
-        // 2. Convert to ingestion request and process with options
+        // 2. Convert document with audit trail
+        ConversionResult conversionResult = documentConverter.convertWithAuditLog(request.getDocument());
+        auditLogs.addAll(conversionResult.auditLogs());
+
+        // 3. Determine index name
+        String indexName = options.map(OpenSearchSinkOptions::indexName)
+                .orElseGet(() -> schemaManager.determineIndexName(
+                        request.getDocument().getSearchMetadata().getDocumentType()));
+        auditLogs.add("Indexing document " + docId + " to collection '" + indexName + "'");
+
+        // 4. Convert to ingestion request and process with options
         StreamDocumentsRequest streamRequest = StreamDocumentsRequest.newBuilder()
             .setRequestId(java.util.UUID.randomUUID().toString())
             .setDocument(request.getDocument())
             .build();
 
         return processSingleRequest(streamRequest, options)
-            .map(streamResponse -> ProcessDataResponse.newBuilder()
-                .setSuccess(streamResponse.getSuccess())
-                .addProcessorLogs(streamResponse.getMessage())
-                .setOutputDoc(request.getDocument())
-                .build());
+            .map(streamResponse -> {
+                long duration = System.currentTimeMillis() - startTime;
+                if (streamResponse.getSuccess()) {
+                    auditLogs.add("Document indexed successfully in " + duration + "ms");
+                } else {
+                    auditLogs.add("Document indexing failed after " + duration + "ms: " + streamResponse.getMessage());
+                }
+                return ProcessDataResponse.newBuilder()
+                    .setSuccess(streamResponse.getSuccess())
+                    .addAllProcessorLogs(auditLogs)
+                    .setOutputDoc(request.getDocument())
+                    .build();
+            });
     }
 
     @Override

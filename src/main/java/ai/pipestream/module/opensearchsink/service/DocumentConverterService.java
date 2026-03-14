@@ -54,17 +54,23 @@ public class DocumentConverterService {
     }
 
     public OpenSearchDocument convertToOpenSearchDocument(PipeDoc document) {
+        return convertWithAuditLog(document).document();
+    }
+
+    public ConversionResult convertWithAuditLog(PipeDoc document) {
+        List<String> auditLogs = new ArrayList<>();
+
         // Use last_modified_date for created_at if available, otherwise use current time
-        Timestamp createdAt = document.getSearchMetadata().hasCreationDate() 
+        Timestamp createdAt = document.getSearchMetadata().hasCreationDate()
             ? document.getSearchMetadata().getCreationDate()
-            : (document.getSearchMetadata().hasLastModifiedDate() 
+            : (document.getSearchMetadata().hasLastModifiedDate()
                 ? document.getSearchMetadata().getLastModifiedDate()
                 : Timestamp.getDefaultInstance());
-        
+
         OpenSearchDocument.Builder builder = OpenSearchDocument.newBuilder()
                 .setOriginalDocId(document.getDocId())
                 .setDocType(document.getSearchMetadata().getDocumentType())
-                .setCreatedBy("") // TODO: Populate from PipeDoc metadata when available
+                .setCreatedBy("")
                 .setCreatedAt(createdAt)
                 .setLastModifiedAt(document.getSearchMetadata().getLastModifiedDate());
 
@@ -85,25 +91,40 @@ public class DocumentConverterService {
             builder.addAllTags(document.getSearchMetadata().getKeywords().getKeywordList());
         }
 
+        int semanticResultCount = document.getSearchMetadata().getSemanticResultsCount();
+        auditLogs.add("Document has " + semanticResultCount + " semantic result sets");
+
         // Convert all embeddings to nested structure
-        populateSemanticSets(document, builder);
+        populateSemanticSets(document, builder, auditLogs);
 
         // Handle custom fields if present
         if (document.getSearchMetadata().hasCustomFields()) {
             builder.setCustomFields(document.getSearchMetadata().getCustomFields());
         }
 
-        return builder.build();
+        return new ConversionResult(builder.build(), auditLogs);
     }
 
-    private void populateSemanticSets(PipeDoc document, OpenSearchDocument.Builder builder) {
+    private void populateSemanticSets(PipeDoc document, OpenSearchDocument.Builder builder, List<String> auditLogs) {
+        int totalEmbeddings = 0;
+        int totalChunksProcessed = 0;
+        int totalChunksDropped = 0;
+        int totalDeduplicated = 0;
+        int setsProcessed = 0;
+
         for (SemanticProcessingResult result : document.getSearchMetadata().getSemanticResultsList()) {
             String chunkConfigId = result.getChunkConfigId();
             String embeddingId = result.getEmbeddingConfigId();
             String sourceFieldName = result.getSourceFieldName();
+            String resultSetName = result.getResultSetName();
 
-            if (chunkConfigId == null || chunkConfigId.isEmpty() || 
+            if (chunkConfigId == null || chunkConfigId.isEmpty() ||
                 embeddingId == null || embeddingId.isEmpty()) {
+                String setDesc = resultSetName != null && !resultSetName.isEmpty() ? resultSetName : "(unnamed)";
+                auditLogs.add("Warning: Skipping semantic result set '" + setDesc
+                        + "' — missing chunk_config_id or embedding_config_id");
+                LOG.warnf("Skipping semantic result set '%s' for doc %s: chunk_config_id='%s', embedding_config_id='%s'",
+                        setDesc, document.getDocId(), chunkConfigId, embeddingId);
                 continue;
             }
 
@@ -114,15 +135,19 @@ public class DocumentConverterService {
 
             // Deduplicate embeddings within this set by source_text
             Map<Integer, OpenSearchEmbedding> embeddingMap = new HashMap<>();
+            int chunksInSet = result.getChunksCount();
+            int droppedInSet = 0;
+            int dedupedInSet = 0;
 
             for (SemanticChunk chunk : result.getChunksList()) {
                 if (!chunk.hasEmbeddingInfo() || chunk.getEmbeddingInfo().getVectorCount() == 0) {
+                    droppedInSet++;
                     continue;
                 }
 
                 String sourceText = chunk.getEmbeddingInfo().getTextContent();
                 int textHash = sourceText.hashCode();
-                
+
                 if (!embeddingMap.containsKey(textHash)) {
                     OpenSearchEmbedding.Builder embeddingBuilder = OpenSearchEmbedding.newBuilder()
                             .addAllVector(chunk.getEmbeddingInfo().getVectorList())
@@ -132,13 +157,43 @@ public class DocumentConverterService {
                             .setIsPrimary(isPrimaryEmbedding(chunk, result));
 
                     embeddingMap.put(textHash, embeddingBuilder.build());
+                } else {
+                    dedupedInSet++;
                 }
+            }
+
+            if (droppedInSet > 0) {
+                auditLogs.add("Warning: " + droppedInSet + " of " + chunksInSet
+                        + " chunks had no vectors and were excluded from vector set '"
+                        + chunkConfigId + "/" + embeddingId + "'");
+                LOG.warnf("Dropped %d chunks without vectors from set %s/%s for doc %s",
+                        droppedInSet, chunkConfigId, embeddingId, document.getDocId());
+            }
+
+            if (dedupedInSet > 0) {
+                auditLogs.add("Deduplication removed " + dedupedInSet
+                        + " duplicate embeddings from vector set '" + chunkConfigId + "/" + embeddingId + "'");
             }
 
             if (!embeddingMap.isEmpty()) {
                 setBuilder.addAllEmbeddings(embeddingMap.values());
                 builder.addSemanticSets(setBuilder.build());
             }
+
+            totalChunksProcessed += chunksInSet;
+            totalChunksDropped += droppedInSet;
+            totalDeduplicated += dedupedInSet;
+            totalEmbeddings += embeddingMap.size();
+            setsProcessed++;
+        }
+
+        auditLogs.add("Extracted " + totalEmbeddings + " embeddings from " + totalChunksProcessed
+                + " chunks across " + setsProcessed + " vector sets");
+        if (totalChunksDropped > 0) {
+            auditLogs.add("Warning: " + totalChunksDropped + " total chunks had no vectors and were excluded from indexing");
+        }
+        if (totalDeduplicated > 0) {
+            auditLogs.add("Deduplication removed " + totalDeduplicated + " total duplicate embeddings");
         }
     }
 
