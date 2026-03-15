@@ -6,10 +6,11 @@ import ai.pipestream.opensearch.v1.OpenSearchDocument;
 import ai.pipestream.opensearch.v1.MutinyOpenSearchManagerServiceGrpc;
 import ai.pipestream.module.opensearchsink.config.OpenSearchSinkOptions;
 import ai.pipestream.module.opensearchsink.service.DocumentConverterService;
-import io.quarkus.grpc.GrpcClient;
+import ai.pipestream.quarkus.dynamicgrpc.DynamicGrpcClientFactory;
 import io.smallrye.mutiny.Uni;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
+import org.eclipse.microprofile.config.inject.ConfigProperty;
 import org.jboss.logging.Logger;
 
 import java.util.Optional;
@@ -17,6 +18,7 @@ import java.util.Optional;
 /**
  * Service responsible for managing OpenSearch index schemas via the OpenSearch Manager.
  * Delegates strictly to OpenSearchManagerService for organic registration and indexing.
+ * Uses DynamicGrpcClientFactory for Consul-based service discovery (consistent with engine pattern).
  */
 @ApplicationScoped
 public class SchemaManagerService {
@@ -26,8 +28,11 @@ public class SchemaManagerService {
     @Inject
     DocumentConverterService documentConverter;
 
-    @GrpcClient("opensearch-manager")
-    MutinyOpenSearchManagerServiceGrpc.MutinyOpenSearchManagerServiceStub openSearchManagerClient;
+    @Inject
+    DynamicGrpcClientFactory grpcClientFactory;
+
+    @ConfigProperty(name = "module.opensearch-sink.manager-service", defaultValue = "opensearch-manager")
+    String managerServiceName;
 
     /**
      * Determines the index name for a given document type.
@@ -76,7 +81,8 @@ public class SchemaManagerService {
             requestBuilder.setDatasourceId(document.getOwnership().getDatasourceId());
         }
 
-        return openSearchManagerClient.indexDocument(requestBuilder.build())
+        return grpcClientFactory.getClient(managerServiceName, MutinyOpenSearchManagerServiceGrpc::newMutinyStub)
+                .flatMap(client -> client.indexDocument(requestBuilder.build()))
                 .onItem().transformToUni(resp -> {
                     if (resp.getSuccess()) {
                         return Uni.createFrom().item(resp.getMessage());
@@ -91,6 +97,7 @@ public class SchemaManagerService {
      */
     public io.smallrye.mutiny.Multi<ai.pipestream.opensearch.v1.StreamIndexDocumentsResponse> streamIndexDocumentsViaManager(
             io.smallrye.mutiny.Multi<ai.pipestream.opensearch.v1.StreamIndexDocumentsRequest> requests) {
-        return openSearchManagerClient.streamIndexDocuments(requests);
+        return grpcClientFactory.getClient(managerServiceName, MutinyOpenSearchManagerServiceGrpc::newMutinyStub)
+                .onItem().transformToMulti(client -> client.streamIndexDocuments(requests));
     }
 }
