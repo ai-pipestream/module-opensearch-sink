@@ -8,6 +8,10 @@ import ai.pipestream.data.module.v1.ProcessDataRequest;
 import ai.pipestream.data.module.v1.ProcessDataResponse;
 import ai.pipestream.data.module.v1.GetServiceRegistrationRequest;
 import ai.pipestream.data.module.v1.GetServiceRegistrationResponse;
+import ai.pipestream.data.v1.LogEntry;
+import ai.pipestream.data.v1.LogEntrySource;
+import ai.pipestream.data.v1.LogLevel;
+import ai.pipestream.data.v1.ModuleLogOrigin;
 import ai.pipestream.module.opensearchsink.config.OpenSearchSinkOptions;
 import ai.pipestream.module.opensearchsink.schema.SchemaExtractorService;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -133,13 +137,13 @@ public class OpenSearchIngestionServiceImpl extends MutinyOpenSearchIngestionSer
     @Override
     public Uni<ProcessDataResponse> processData(ProcessDataRequest request) {
         long startTime = System.currentTimeMillis();
-        List<String> auditLogs = new ArrayList<>();
+        List<LogEntry> auditLogs = new ArrayList<>();
         LOG.info("ProcessData called for OpenSearch sink module");
 
         if (!request.hasDocument()) {
             return Uni.createFrom().item(ProcessDataResponse.newBuilder()
                 .setSuccess(false)
-                .addProcessorLogs("No document provided in request")
+                .addLogEntries(moduleLog("No document provided in request", LogLevel.LOG_LEVEL_ERROR))
                 .build());
         }
 
@@ -156,20 +160,20 @@ public class OpenSearchIngestionServiceImpl extends MutinyOpenSearchIngestionSer
                 LOG.error("Failed to parse Sink configuration from request", e);
                 return Uni.createFrom().item(ProcessDataResponse.newBuilder()
                         .setSuccess(false)
-                        .addProcessorLogs("Invalid configuration: " + e.getMessage())
+                        .addLogEntries(moduleLog("Invalid configuration: " + e.getMessage(), LogLevel.LOG_LEVEL_ERROR))
                         .build());
             }
         }
 
         // 2. Convert document with audit trail
         ConversionResult conversionResult = documentConverter.convertWithAuditLog(request.getDocument());
-        auditLogs.addAll(conversionResult.auditLogs());
+        conversionResult.auditLogs().forEach(msg -> auditLogs.add(moduleLog(msg, LogLevel.LOG_LEVEL_INFO)));
 
         // 3. Determine index name
         String indexName = options.map(OpenSearchSinkOptions::indexName)
                 .orElseGet(() -> schemaManager.determineIndexName(
                         request.getDocument().getSearchMetadata().getDocumentType()));
-        auditLogs.add("Indexing document " + docId + " to collection '" + indexName + "'");
+        auditLogs.add(moduleLog("Indexing document " + docId + " to collection '" + indexName + "'", LogLevel.LOG_LEVEL_INFO));
 
         // 4. Convert to ingestion request and process with options
         StreamDocumentsRequest streamRequest = StreamDocumentsRequest.newBuilder()
@@ -181,16 +185,26 @@ public class OpenSearchIngestionServiceImpl extends MutinyOpenSearchIngestionSer
             .map(streamResponse -> {
                 long duration = System.currentTimeMillis() - startTime;
                 if (streamResponse.getSuccess()) {
-                    auditLogs.add("Document indexed successfully in " + duration + "ms");
+                    auditLogs.add(moduleLog("Document indexed successfully in " + duration + "ms", LogLevel.LOG_LEVEL_INFO));
                 } else {
-                    auditLogs.add("Document indexing failed after " + duration + "ms: " + streamResponse.getMessage());
+                    auditLogs.add(moduleLog("Document indexing failed after " + duration + "ms: " + streamResponse.getMessage(), LogLevel.LOG_LEVEL_ERROR));
                 }
                 return ProcessDataResponse.newBuilder()
                     .setSuccess(streamResponse.getSuccess())
-                    .addAllProcessorLogs(auditLogs)
+                    .addAllLogEntries(auditLogs)
                     .setOutputDoc(request.getDocument())
                     .build();
             });
+    }
+
+    private static LogEntry moduleLog(String message, LogLevel level) {
+        return LogEntry.newBuilder()
+            .setSource(LogEntrySource.LOG_ENTRY_SOURCE_MODULE)
+            .setLevel(level)
+            .setMessage(message)
+            .setTimestampEpochMs(System.currentTimeMillis())
+            .setModule(ModuleLogOrigin.newBuilder().setModuleName("opensearch-sink").build())
+            .build();
     }
 
     @Override
