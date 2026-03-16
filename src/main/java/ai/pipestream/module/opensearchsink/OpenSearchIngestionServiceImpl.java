@@ -17,6 +17,7 @@ import ai.pipestream.module.opensearchsink.schema.SchemaExtractorService;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.protobuf.util.JsonFormat;
 import io.quarkus.grpc.GrpcService;
+import io.quarkus.runtime.Quarkus;
 import io.quarkus.runtime.annotations.RegisterForReflection;
 import io.smallrye.mutiny.Multi;
 import io.smallrye.mutiny.Uni;
@@ -24,6 +25,7 @@ import io.quarkus.runtime.StartupEvent;
 import jakarta.enterprise.event.Observes;
 import jakarta.inject.Inject;
 import jakarta.inject.Singleton;
+import org.eclipse.microprofile.config.inject.ConfigProperty;
 import org.jboss.logging.Logger;
 
 import ai.pipestream.module.opensearchsink.service.ConversionResult;
@@ -54,6 +56,21 @@ public class OpenSearchIngestionServiceImpl extends MutinyOpenSearchIngestionSer
 
     @Inject
     ObjectMapper objectMapper;
+
+    @ConfigProperty(name = "quarkus.application.version", defaultValue = "unknown")
+    String appVersion;
+
+    @ConfigProperty(name = "quarkus.profile", defaultValue = "prod")
+    String activeProfile;
+
+    @ConfigProperty(name = "pipestream.build.commit", defaultValue = "unknown")
+    String buildCommit;
+
+    @ConfigProperty(name = "pipestream.build.branch", defaultValue = "unknown")
+    String buildBranch;
+
+    @ConfigProperty(name = "pipestream.build.time", defaultValue = "unknown")
+    String buildTime;
 
     void onStart(@Observes StartupEvent ev) {
         LOG.info("OpenSearch Ingestion Service starting...");
@@ -213,9 +230,10 @@ public class OpenSearchIngestionServiceImpl extends MutinyOpenSearchIngestionSer
 
         GetServiceRegistrationResponse.Builder responseBuilder = GetServiceRegistrationResponse.newBuilder()
                 .setModuleName("opensearch-sink")
-                .setVersion("0.1.2-SNAPSHOT")
+                .setVersion(appVersion)
                 .setDisplayName("OpenSearch Sink")
                 .setDescription("OpenSearch vector indexing sink with organic schema management")
+                .putAllMetadata(buildRegistrationMetadata())
                 .setHealthCheckPassed(true)
                 .setHealthCheckMessage("OpenSearch sink module is healthy");
 
@@ -223,5 +241,26 @@ public class OpenSearchIngestionServiceImpl extends MutinyOpenSearchIngestionSer
                 .ifPresent(responseBuilder::setJsonConfigSchema);
 
         return Uni.createFrom().item(responseBuilder.build());
+    }
+
+    private java.util.Map<String, String> buildRegistrationMetadata() {
+        java.util.Map<String, String> metadata = new java.util.HashMap<>();
+        metadata.put("build.version", appVersion);
+        metadata.put("build.commit", buildCommit);
+        metadata.put("build.branch", buildBranch);
+        metadata.put("build.time", buildTime);
+        metadata.put("runtime.java", System.getProperty("java.version", "unknown"));
+        metadata.put("runtime.quarkus", quarkusVersion());
+        metadata.put("runtime.profile", activeProfile);
+        metadata.put("runtime.hostname", System.getenv().getOrDefault("HOSTNAME", "unknown"));
+        return metadata;
+    }
+
+    private String quarkusVersion() {
+        Package quarkusPackage = Quarkus.class.getPackage();
+        if (quarkusPackage != null && quarkusPackage.getImplementationVersion() != null) {
+            return quarkusPackage.getImplementationVersion();
+        }
+        return "unknown";
     }
 }
