@@ -59,8 +59,8 @@ dependencies {
     implementation 'io.smallrye.stork:stork-service-discovery-consul'
     implementation 'io.smallrye.reactive:smallrye-mutiny-vertx-consul-client'
 
-    // Pipestream OpenSearch extension (provides OpenSearchClient, ReactiveOpenSearchClient)
-    implementation 'ai.pipestream:pipestream-opensearch'
+    // OpenSearch client extension (REST + gRPC clients, health checks, DevServices)
+    implementation libs.pipestream.opensearch.client
     // OpenSearch Java client types (mapping types for schema, etc.)
     implementation libs.opensearch.java
 
