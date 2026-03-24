@@ -97,9 +97,28 @@ public class DocumentConverterService {
         // Convert all embeddings to nested structure
         populateSemanticSets(document, builder, auditLogs);
 
-        // Handle custom fields if present
+        // Handle custom fields and metadata map
+        com.google.protobuf.Struct.Builder customFieldsBuilder = com.google.protobuf.Struct.newBuilder();
+        boolean hasCustomFields = false;
+
+        // Copy existing custom_fields if present
         if (document.getSearchMetadata().hasCustomFields()) {
-            builder.setCustomFields(document.getSearchMetadata().getCustomFields());
+            customFieldsBuilder.putAllFields(document.getSearchMetadata().getCustomFields().getFieldsMap());
+            hasCustomFields = true;
+        }
+
+        // Promote metadata map entries into custom_fields so they're searchable in OpenSearch
+        if (document.getSearchMetadata().getMetadataCount() > 0) {
+            for (var entry : document.getSearchMetadata().getMetadataMap().entrySet()) {
+                customFieldsBuilder.putFields(entry.getKey(),
+                        com.google.protobuf.Value.newBuilder().setStringValue(entry.getValue()).build());
+            }
+            hasCustomFields = true;
+            auditLogs.add("Promoted " + document.getSearchMetadata().getMetadataCount() + " metadata entries to custom_fields");
+        }
+
+        if (hasCustomFields) {
+            builder.setCustomFields(customFieldsBuilder.build());
         }
 
         return new ConversionResult(builder.build(), auditLogs);
