@@ -6,6 +6,7 @@ import ai.pipestream.ingestion.v1.StreamDocumentsResponse;
 import ai.pipestream.data.module.v1.PipeStepProcessorService;
 import ai.pipestream.data.module.v1.ProcessDataRequest;
 import ai.pipestream.data.module.v1.ProcessDataResponse;
+import ai.pipestream.data.module.v1.ProcessingOutcome;
 import ai.pipestream.data.module.v1.GetServiceRegistrationRequest;
 import ai.pipestream.data.module.v1.GetServiceRegistrationResponse;
 import ai.pipestream.data.v1.LogEntry;
@@ -146,7 +147,7 @@ public class OpenSearchIngestionServiceImpl extends MutinyOpenSearchIngestionSer
 
         if (!request.hasDocument()) {
             return Uni.createFrom().item(ProcessDataResponse.newBuilder()
-                .setSuccess(false)
+                .setOutcome(ProcessingOutcome.PROCESSING_OUTCOME_FAILURE)
                 .addLogEntries(moduleLog("No document provided in request", LogLevel.LOG_LEVEL_ERROR))
                 .build());
         }
@@ -163,7 +164,7 @@ public class OpenSearchIngestionServiceImpl extends MutinyOpenSearchIngestionSer
             } catch (Exception e) {
                 LOG.error("Failed to parse Sink configuration from request", e);
                 return Uni.createFrom().item(ProcessDataResponse.newBuilder()
-                        .setSuccess(false)
+                        .setOutcome(ProcessingOutcome.PROCESSING_OUTCOME_FAILURE)
                         .addLogEntries(moduleLog("Invalid configuration: " + e.getMessage(), LogLevel.LOG_LEVEL_ERROR))
                         .build());
             }
@@ -194,7 +195,7 @@ public class OpenSearchIngestionServiceImpl extends MutinyOpenSearchIngestionSer
                     auditLogs.add(moduleLog("Document indexing failed after " + duration + "ms: " + streamResponse.getMessage(), LogLevel.LOG_LEVEL_ERROR));
                 }
                 return ProcessDataResponse.newBuilder()
-                    .setSuccess(streamResponse.getSuccess())
+                    .setOutcome(streamResponse.getSuccess() ? ProcessingOutcome.PROCESSING_OUTCOME_SUCCESS : ProcessingOutcome.PROCESSING_OUTCOME_FAILURE)
                     .addAllLogEntries(auditLogs)
                     .setOutputDoc(request.getDocument())
                     .build();

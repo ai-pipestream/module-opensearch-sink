@@ -114,7 +114,7 @@ public class OpenSearchSinkServiceTest {
 
         ai.pipestream.data.module.v1.ProcessDataResponse response = processorClient.processData(request).await().indefinitely();
 
-        assertTrue(response.getSuccess());
+        assertEquals(ai.pipestream.data.module.v1.ProcessingOutcome.PROCESSING_OUTCOME_SUCCESS, response.getOutcome());
         assertTrue(response.getLogEntriesList().stream().map(LogEntry::getMessage).anyMatch(log -> log.contains("WireMock") || log.contains("indexed")));
     }
 
