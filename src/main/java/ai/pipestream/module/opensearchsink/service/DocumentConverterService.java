@@ -94,6 +94,22 @@ public class DocumentConverterService {
         int semanticResultCount = document.getSearchMetadata().getSemanticResultsCount();
         auditLogs.add("Document has " + semanticResultCount + " semantic result sets");
 
+        // Populate document-level analytics from PipeDoc
+        if (document.getSearchMetadata().getSourceFieldAnalyticsCount() > 0) {
+            builder.addAllSourceFieldAnalytics(document.getSearchMetadata().getSourceFieldAnalyticsList());
+            auditLogs.add("Mapped " + document.getSearchMetadata().getSourceFieldAnalyticsCount()
+                    + " source field analytics entries");
+        }
+
+        // Populate NLP analysis from first SemanticProcessingResult that has it
+        for (SemanticProcessingResult result : document.getSearchMetadata().getSemanticResultsList()) {
+            if (result.hasNlpAnalysis()) {
+                builder.setNlpAnalysis(result.getNlpAnalysis());
+                auditLogs.add("Mapped NLP analysis (language=" + result.getNlpAnalysis().getDetectedLanguage() + ")");
+                break;  // One NLP pass shared across all results
+            }
+        }
+
         // Convert all embeddings to nested structure
         populateSemanticSets(document, builder, auditLogs);
 
@@ -174,6 +190,11 @@ public class DocumentConverterService {
                             .setChunkConfigId(chunkConfigId)
                             .setEmbeddingId(embeddingId)
                             .setIsPrimary(isPrimaryEmbedding(chunk, result));
+
+                    // Transfer per-chunk analytics if available
+                    if (chunk.hasChunkAnalytics()) {
+                        embeddingBuilder.setChunkAnalytics(chunk.getChunkAnalytics());
+                    }
 
                     embeddingMap.put(textHash, embeddingBuilder.build());
                 } else {
