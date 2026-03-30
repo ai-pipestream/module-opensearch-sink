@@ -1,8 +1,6 @@
 package ai.pipestream.module.opensearchsink.service;
 
-import com.google.protobuf.ByteString;
 import com.google.protobuf.Timestamp;
-import com.google.protobuf.util.JsonFormat;
 import ai.pipestream.data.v1.PipeDoc;
 import ai.pipestream.data.v1.SemanticChunk;
 import ai.pipestream.data.v1.SemanticProcessingResult;
@@ -11,10 +9,6 @@ import ai.pipestream.opensearch.v1.OpenSearchDocument;
 import ai.pipestream.opensearch.v1.SemanticVectorSet;
 import jakarta.enterprise.context.ApplicationScoped;
 import org.jboss.logging.Logger;
-import org.opensearch.protobufs.BulkRequest;
-import org.opensearch.protobufs.BulkRequestBody;
-import org.opensearch.protobufs.IndexOperation;
-import org.opensearch.protobufs.OperationContainer;
 
 import java.util.*;
 
@@ -22,36 +16,6 @@ import java.util.*;
 public class DocumentConverterService {
 
     private static final Logger LOG = Logger.getLogger(DocumentConverterService.class);
-
-    /**
-     * Prepare a gRPC BulkRequest for indexing the document via DocumentService.
-     */
-    public BulkRequest prepareBulkRequest(PipeDoc document, String indexName) {
-        OpenSearchDocument osDoc = convertToOpenSearchDocument(document);
-
-        try {
-            String jsonDoc = JsonFormat.printer().print(osDoc);
-            ByteString docBytes = ByteString.copyFromUtf8(jsonDoc);
-
-            IndexOperation indexOp = IndexOperation.newBuilder()
-                    .setXIndex(indexName)
-                    .setXId(document.getDocId())
-                    .build();
-
-            BulkRequestBody body = BulkRequestBody.newBuilder()
-                    .setOperationContainer(OperationContainer.newBuilder().setIndex(indexOp).build())
-                    .setObject(docBytes)
-                    .build();
-
-            return BulkRequest.newBuilder()
-                    .setIndex(indexName)
-                    .addBulkRequestBody(body)
-                    .build();
-        } catch (Exception e) {
-            LOG.errorf(e, "Failed to convert document %s to JSON", document.getDocId());
-            throw new RuntimeException("Document conversion failed", e);
-        }
-    }
 
     public OpenSearchDocument convertToOpenSearchDocument(PipeDoc document) {
         return convertWithAuditLog(document).document();
