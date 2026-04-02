@@ -131,6 +131,13 @@ public class DocumentConverterService {
                     .setSourceFieldName(sourceFieldName != null ? sourceFieldName : "unknown")
                     .setChunkConfigId(chunkConfigId)
                     .setEmbeddingId(embeddingId);
+            // Propagate semantic config reference for semantic resolution path
+            if (result.hasSemanticConfigId() && !result.getSemanticConfigId().isEmpty()) {
+                setBuilder.setSemanticConfigId(result.getSemanticConfigId());
+            }
+            if (result.hasSemanticGranularity() && !result.getSemanticGranularity().isEmpty()) {
+                setBuilder.setGranularity(mapStringToGranularity(result.getSemanticGranularity()));
+            }
 
             // Deduplicate embeddings within this set by source_text
             Map<Integer, OpenSearchEmbedding> embeddingMap = new HashMap<>();
@@ -205,10 +212,21 @@ public class DocumentConverterService {
         // Primary embeddings are typically from non-chunked fields like title, author, etc.
         // This is a heuristic - you may want to make this configurable
         String chunkConfigId = result.getChunkConfigId();
-        return chunkConfigId != null && 
-               (chunkConfigId.contains("title") || 
-                chunkConfigId.contains("author") || 
+        return chunkConfigId != null &&
+               (chunkConfigId.contains("title") ||
+                chunkConfigId.contains("author") ||
                 chunkConfigId.contains("summary") ||
                 !chunkConfigId.contains("chunk"));
+    }
+
+    private ai.pipestream.opensearch.v1.SemanticGranularity mapStringToGranularity(String granularity) {
+        return switch (granularity) {
+            case "SEMANTIC_CHUNK" -> ai.pipestream.opensearch.v1.SemanticGranularity.SEMANTIC_GRANULARITY_SEMANTIC_CHUNK;
+            case "SENTENCE" -> ai.pipestream.opensearch.v1.SemanticGranularity.SEMANTIC_GRANULARITY_SENTENCE;
+            case "PARAGRAPH" -> ai.pipestream.opensearch.v1.SemanticGranularity.SEMANTIC_GRANULARITY_PARAGRAPH;
+            case "SECTION" -> ai.pipestream.opensearch.v1.SemanticGranularity.SEMANTIC_GRANULARITY_SECTION;
+            case "DOCUMENT" -> ai.pipestream.opensearch.v1.SemanticGranularity.SEMANTIC_GRANULARITY_DOCUMENT;
+            default -> ai.pipestream.opensearch.v1.SemanticGranularity.SEMANTIC_GRANULARITY_UNSPECIFIED;
+        };
     }
 }
