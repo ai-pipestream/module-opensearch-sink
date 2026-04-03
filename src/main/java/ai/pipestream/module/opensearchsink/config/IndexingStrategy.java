@@ -19,8 +19,25 @@ public enum IndexingStrategy {
     /**
      * Parent and child documents are stored as separate documents linked by a join field.
      * Better suited for documents with very large numbers of chunks.
+     * @deprecated Legacy strategy, unused. Prefer CHUNK_COMBINED or SEPARATE_INDICES.
      */
     @Schema(description = "Parent and child documents are stored as separate documents linked by a join field. " +
                           "Better for documents with hundreds or thousands of chunks.")
-    PARENT_CHILD
+    PARENT_CHILD,
+
+    /**
+     * One flat index per chunk configuration. Multiple embedding model columns per row.
+     * Enables cross-model scoring on the same chunk without joins.
+     */
+    @Schema(description = "One flat index per chunk config. Multiple embedding vectors per row. " +
+                          "Enables cross-model scoring on the same chunk without joins.")
+    CHUNK_COMBINED,
+
+    /**
+     * One flat index per (chunk config x embedding model). Single vector column per row.
+     * Maximum isolation. Simplest mapping and queries.
+     */
+    @Schema(description = "One flat index per (chunk config x embedding model). Single vector column per row. " +
+                          "Maximum isolation and simplest mapping.")
+    SEPARATE_INDICES
 }

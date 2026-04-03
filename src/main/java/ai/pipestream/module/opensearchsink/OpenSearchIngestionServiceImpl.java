@@ -174,11 +174,14 @@ public class OpenSearchIngestionServiceImpl extends MutinyOpenSearchIngestionSer
         ConversionResult conversionResult = documentConverter.convertWithAuditLog(request.getDocument());
         conversionResult.auditLogs().forEach(msg -> auditLogs.add(moduleLog(msg, LogLevel.LOG_LEVEL_INFO)));
 
-        // 3. Determine index name
+        // 3. Determine index name and log strategy
         String indexName = options.map(OpenSearchSinkOptions::indexName)
                 .orElseGet(() -> schemaManager.determineIndexName(
                         request.getDocument().getSearchMetadata().getDocumentType()));
-        auditLogs.add(moduleLog("Indexing document " + docId + " to collection '" + indexName + "'", LogLevel.LOG_LEVEL_INFO));
+        String strategyName = options.map(o -> o.indexingStrategy() != null ? o.indexingStrategy().name() : "NESTED")
+                .orElse("NESTED");
+        auditLogs.add(moduleLog("Indexing document " + docId + " to collection '" + indexName
+                + "' with strategy " + strategyName, LogLevel.LOG_LEVEL_INFO));
 
         // 4. Convert to ingestion request and process with options
         StreamDocumentsRequest streamRequest = StreamDocumentsRequest.newBuilder()
