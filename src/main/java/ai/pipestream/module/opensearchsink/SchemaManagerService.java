@@ -63,7 +63,9 @@ public class SchemaManagerService {
      * For NESTED (the default), the existing single-document flow is used unchanged.
      *
      * @param indexName The target index name
-     * @param document The source PipeDoc
+     * @param document The source PipeDoc (used for metadata such as document ID and ownership)
+     * @param osDoc The already-converted {@link OpenSearchDocument} to index; provided by the caller
+     *              to avoid redundant conversion
      * @param options Optional request-time Sink configuration (includes instance routing and strategy)
      * @return The message from the manager response
      */
