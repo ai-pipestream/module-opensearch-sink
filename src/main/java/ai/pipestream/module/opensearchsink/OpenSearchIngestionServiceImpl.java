@@ -109,36 +109,6 @@ public class OpenSearchIngestionServiceImpl extends MutinyOpenSearchIngestionSer
                 .onFailure().invoke(t -> LOG.error("Stream to manager failed", t));
     }
 
-    private Uni<StreamDocumentsResponse> processSingleRequest(StreamDocumentsRequest request, Optional<OpenSearchSinkOptions> options) {
-        if (!request.hasDocument()) {
-            return Uni.createFrom().item(buildResponse(request, false, "StreamDocumentsRequest has no document."));
-        }
-
-        // Use index name from Engine options if provided, otherwise fallback to document type inference
-        String indexName = options.map(OpenSearchSinkOptions::indexName)
-                .orElseGet(() -> schemaManager.determineIndexName(request.getDocument().getSearchMetadata().getDocumentType()));
-
-        return schemaManager.indexDocumentViaManager(indexName, request.getDocument(), options)
-                .onItem().transform(managerMessage -> {
-                    LOG.infof("Successfully indexed document %s into %s via manager", request.getDocument().getDocId(), indexName);
-                    return buildResponse(request, true, managerMessage);
-                })
-                .onFailure().recoverWithUni(error -> {
-                    LOG.errorf(error, "Failed to process document %s via manager", request.getDocument().getDocId());
-                    return Uni.createFrom().item(buildResponse(request, false, "Indexing failed: " + error.getMessage()));
-                });
-    }
-
-    private StreamDocumentsResponse buildResponse(StreamDocumentsRequest request, boolean success, String message) {
-        String docId = request.hasDocument() ? request.getDocument().getDocId() : "";
-        return StreamDocumentsResponse.newBuilder()
-                .setRequestId(request.getRequestId())
-                .setDocumentId(docId)
-                .setSuccess(success)
-                .setMessage(message)
-                .build();
-    }
-
     @Override
     public Uni<ProcessDataResponse> processData(ProcessDataRequest request) {
         long startTime = System.currentTimeMillis();
@@ -170,7 +140,7 @@ public class OpenSearchIngestionServiceImpl extends MutinyOpenSearchIngestionSer
             }
         }
 
-        // 2. Convert document with audit trail
+        // 2. Convert document once — reused for both audit trail and indexing
         ConversionResult conversionResult = documentConverter.convertWithAuditLog(request.getDocument());
         conversionResult.auditLogs().forEach(msg -> auditLogs.add(moduleLog(msg, LogLevel.LOG_LEVEL_INFO)));
 
@@ -183,22 +153,23 @@ public class OpenSearchIngestionServiceImpl extends MutinyOpenSearchIngestionSer
         auditLogs.add(moduleLog("Indexing document " + docId + " to collection '" + indexName
                 + "' with strategy " + strategyName, LogLevel.LOG_LEVEL_INFO));
 
-        // 4. Convert to ingestion request and process with options
-        StreamDocumentsRequest streamRequest = StreamDocumentsRequest.newBuilder()
-            .setRequestId(java.util.UUID.randomUUID().toString())
-            .setDocument(request.getDocument())
-            .build();
-
-        return processSingleRequest(streamRequest, options)
-            .map(streamResponse -> {
+        // 4. Index via manager — pass the already-converted OpenSearchDocument (no double conversion)
+        return schemaManager.indexDocumentViaManager(indexName, request.getDocument(), conversionResult.document(), options)
+            .map(managerMessage -> {
                 long duration = System.currentTimeMillis() - startTime;
-                if (streamResponse.getSuccess()) {
-                    auditLogs.add(moduleLog("Document indexed successfully in " + duration + "ms", LogLevel.LOG_LEVEL_INFO));
-                } else {
-                    auditLogs.add(moduleLog("Document indexing failed after " + duration + "ms: " + streamResponse.getMessage(), LogLevel.LOG_LEVEL_ERROR));
-                }
+                auditLogs.add(moduleLog("Document indexed successfully in " + duration + "ms", LogLevel.LOG_LEVEL_INFO));
                 return ProcessDataResponse.newBuilder()
-                    .setOutcome(streamResponse.getSuccess() ? ProcessingOutcome.PROCESSING_OUTCOME_SUCCESS : ProcessingOutcome.PROCESSING_OUTCOME_FAILURE)
+                    .setOutcome(ProcessingOutcome.PROCESSING_OUTCOME_SUCCESS)
+                    .addAllLogEntries(auditLogs)
+                    .setOutputDoc(request.getDocument())
+                    .build();
+            })
+            .onFailure().recoverWithItem(error -> {
+                long duration = System.currentTimeMillis() - startTime;
+                LOG.errorf(error, "Failed to index document %s via manager", docId);
+                auditLogs.add(moduleLog("Document indexing failed after " + duration + "ms: " + error.getMessage(), LogLevel.LOG_LEVEL_ERROR));
+                return ProcessDataResponse.newBuilder()
+                    .setOutcome(ProcessingOutcome.PROCESSING_OUTCOME_FAILURE)
                     .addAllLogEntries(auditLogs)
                     .setOutputDoc(request.getDocument())
                     .build();

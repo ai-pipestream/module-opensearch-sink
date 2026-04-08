@@ -140,7 +140,7 @@ public class DocumentConverterService {
             }
 
             // Deduplicate embeddings within this set by source_text
-            Map<Integer, OpenSearchEmbedding> embeddingMap = new HashMap<>();
+            Map<String, OpenSearchEmbedding> embeddingMap = new LinkedHashMap<>();
             int chunksInSet = result.getChunksCount();
             int droppedInSet = 0;
             int dedupedInSet = 0;
@@ -152,9 +152,8 @@ public class DocumentConverterService {
                 }
 
                 String sourceText = chunk.getEmbeddingInfo().getTextContent();
-                int textHash = sourceText.hashCode();
 
-                if (!embeddingMap.containsKey(textHash)) {
+                if (!embeddingMap.containsKey(sourceText)) {
                     OpenSearchEmbedding.Builder embeddingBuilder = OpenSearchEmbedding.newBuilder()
                             .addAllVector(chunk.getEmbeddingInfo().getVectorList())
                             .setSourceText(sourceText)
@@ -167,7 +166,7 @@ public class DocumentConverterService {
                         embeddingBuilder.setChunkAnalytics(chunk.getChunkAnalytics());
                     }
 
-                    embeddingMap.put(textHash, embeddingBuilder.build());
+                    embeddingMap.put(sourceText, embeddingBuilder.build());
                 } else {
                     dedupedInSet++;
                 }

@@ -592,6 +592,87 @@ class DocumentConverterServiceTest {
     }
 
     // =========================================================================
+    // Deduplication correctness tests
+    // =========================================================================
+
+    @Test
+    void deduplication_textsWithSameHashCode_bothPreserved() {
+        // Java String hashCode collisions: "Aa" and "BB" have the same hashCode (2112)
+        // Prior bug used hashCode() as map key — would silently drop the second text
+        String text1 = "Aa";
+        String text2 = "BB";
+        assertThat(text1.hashCode())
+                .as("precondition: texts must have same hashCode to test collision")
+                .isEqualTo(text2.hashCode());
+
+        SemanticProcessingResult result = SemanticProcessingResult.newBuilder()
+                .setSourceFieldName("body")
+                .setChunkConfigId("c1")
+                .setEmbeddingConfigId("m1")
+                .addChunks(SemanticChunk.newBuilder()
+                        .setEmbeddingInfo(ChunkEmbedding.newBuilder()
+                                .setTextContent(text1).addVector(1.0f).build()))
+                .addChunks(SemanticChunk.newBuilder()
+                        .setEmbeddingInfo(ChunkEmbedding.newBuilder()
+                                .setTextContent(text2).addVector(2.0f).build()))
+                .build();
+
+        PipeDoc doc = PipeDoc.newBuilder()
+                .setDocId("hash-collision-test")
+                .setSearchMetadata(SearchMetadata.newBuilder().addSemanticResults(result).build())
+                .build();
+
+        OpenSearchDocument osDoc = converter.convertToOpenSearchDocument(doc);
+
+        assertThat(osDoc.getSemanticSets(0).getEmbeddingsCount())
+                .as("both texts with same hashCode must be preserved (no hash collision)")
+                .isEqualTo(2);
+
+        var sourceTexts = osDoc.getSemanticSets(0).getEmbeddingsList().stream()
+                .map(e -> e.getSourceText())
+                .toList();
+        assertThat(sourceTexts)
+                .as("both distinct texts present in output")
+                .containsExactlyInAnyOrder(text1, text2);
+    }
+
+    @Test
+    void deduplication_preservesInsertionOrder() {
+        // Verify that deduplication preserves the order embeddings appear in the input
+        SemanticProcessingResult result = SemanticProcessingResult.newBuilder()
+                .setSourceFieldName("body")
+                .setChunkConfigId("c1")
+                .setEmbeddingConfigId("m1")
+                .addChunks(SemanticChunk.newBuilder()
+                        .setEmbeddingInfo(ChunkEmbedding.newBuilder()
+                                .setTextContent("first").addVector(1.0f).build()))
+                .addChunks(SemanticChunk.newBuilder()
+                        .setEmbeddingInfo(ChunkEmbedding.newBuilder()
+                                .setTextContent("second").addVector(2.0f).build()))
+                .addChunks(SemanticChunk.newBuilder()
+                        .setEmbeddingInfo(ChunkEmbedding.newBuilder()
+                                .setTextContent("first").addVector(1.0f).build()))  // duplicate
+                .addChunks(SemanticChunk.newBuilder()
+                        .setEmbeddingInfo(ChunkEmbedding.newBuilder()
+                                .setTextContent("third").addVector(3.0f).build()))
+                .build();
+
+        PipeDoc doc = PipeDoc.newBuilder()
+                .setDocId("order-test")
+                .setSearchMetadata(SearchMetadata.newBuilder().addSemanticResults(result).build())
+                .build();
+
+        OpenSearchDocument osDoc = converter.convertToOpenSearchDocument(doc);
+
+        var sourceTexts = osDoc.getSemanticSets(0).getEmbeddingsList().stream()
+                .map(e -> e.getSourceText())
+                .toList();
+        assertThat(sourceTexts)
+                .as("dedup preserves insertion order of first occurrence")
+                .containsExactly("first", "second", "third");
+    }
+
+    // =========================================================================
     // Helpers
     // =========================================================================
 
