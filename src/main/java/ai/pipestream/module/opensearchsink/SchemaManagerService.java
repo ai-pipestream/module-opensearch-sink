@@ -8,7 +8,6 @@ import ai.pipestream.module.opensearchsink.config.IndexingStrategy;
 import ai.pipestream.module.opensearchsink.config.OpenSearchSinkOptions;
 import ai.pipestream.module.opensearchsink.service.ChunkConversionResult;
 import ai.pipestream.module.opensearchsink.service.ChunkDocumentConverter;
-import ai.pipestream.module.opensearchsink.service.DocumentConverterService;
 import ai.pipestream.quarkus.dynamicgrpc.DynamicGrpcClientFactory;
 import io.smallrye.mutiny.Uni;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -29,9 +28,6 @@ import java.util.Optional;
 public class SchemaManagerService {
 
     private static final Logger LOG = Logger.getLogger(SchemaManagerService.class);
-
-    @Inject
-    DocumentConverterService documentConverter;
 
     @Inject
     ChunkDocumentConverter chunkDocumentConverter;
@@ -67,12 +63,13 @@ public class SchemaManagerService {
      * For NESTED (the default), the existing single-document flow is used unchanged.
      *
      * @param indexName The target index name
-     * @param document The source PipeDoc
+     * @param document The source PipeDoc (used for metadata such as document ID and ownership)
+     * @param osDoc The already-converted {@link OpenSearchDocument} to index; provided by the caller
+     *              to avoid redundant conversion
      * @param options Optional request-time Sink configuration (includes instance routing and strategy)
      * @return The message from the manager response
      */
-    public Uni<String> indexDocumentViaManager(String indexName, PipeDoc document, Optional<OpenSearchSinkOptions> options) {
-        OpenSearchDocument osDoc = documentConverter.convertToOpenSearchDocument(document);
+    public Uni<String> indexDocumentViaManager(String indexName, PipeDoc document, OpenSearchDocument osDoc, Optional<OpenSearchSinkOptions> options) {
         List<String> auditLogs = new ArrayList<>();
 
         IndexDocumentRequest.Builder requestBuilder = IndexDocumentRequest.newBuilder()

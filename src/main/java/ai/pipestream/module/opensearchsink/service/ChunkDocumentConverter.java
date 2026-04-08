@@ -378,7 +378,9 @@ public class ChunkDocumentConverter {
         }
 
         void addEmbedding(String embeddingId, List<Float> vector) {
-            embeddings.put(embeddingId, new ArrayList<>(vector));
+            // Protobuf lists are immutable — safe to store reference directly, no copy needed.
+            // The FloatVector builder in buildChunkCombinedDocuments will read from this list.
+            embeddings.put(embeddingId, vector);
         }
     }
 }
