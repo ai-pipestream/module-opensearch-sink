@@ -157,6 +157,7 @@ public class OpenSearchIngestionServiceImpl extends MutinyOpenSearchIngestionSer
         return schemaManager.indexDocumentViaManager(indexName, request.getDocument(), conversionResult.document(), options)
             .map(managerMessage -> {
                 long duration = System.currentTimeMillis() - startTime;
+                LOG.infof("OpenSearch sink indexed docId=%s index=%s in %dms", docId, indexName, duration);
                 auditLogs.add(moduleLog("Document indexed successfully in " + duration + "ms", LogLevel.LOG_LEVEL_INFO));
                 return ProcessDataResponse.newBuilder()
                     .setOutcome(ProcessingOutcome.PROCESSING_OUTCOME_SUCCESS)
