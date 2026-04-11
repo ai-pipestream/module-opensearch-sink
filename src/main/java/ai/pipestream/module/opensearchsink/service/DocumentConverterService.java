@@ -135,8 +135,8 @@ public class DocumentConverterService {
             if (result.hasSemanticConfigId() && !result.getSemanticConfigId().isEmpty()) {
                 setBuilder.setSemanticConfigId(result.getSemanticConfigId());
             }
-            if (result.hasSemanticGranularity() && !result.getSemanticGranularity().isEmpty()) {
-                setBuilder.setGranularity(mapStringToGranularity(result.getSemanticGranularity()));
+            if (result.hasGranularity()) {
+                setBuilder.setGranularity(result.getGranularity());
             }
 
             // Deduplicate embeddings within this set by source_text
@@ -218,14 +218,4 @@ public class DocumentConverterService {
                 !chunkConfigId.contains("chunk"));
     }
 
-    private ai.pipestream.opensearch.v1.SemanticGranularity mapStringToGranularity(String granularity) {
-        return switch (granularity) {
-            case "SEMANTIC_CHUNK" -> ai.pipestream.opensearch.v1.SemanticGranularity.SEMANTIC_GRANULARITY_SEMANTIC_CHUNK;
-            case "SENTENCE" -> ai.pipestream.opensearch.v1.SemanticGranularity.SEMANTIC_GRANULARITY_SENTENCE;
-            case "PARAGRAPH" -> ai.pipestream.opensearch.v1.SemanticGranularity.SEMANTIC_GRANULARITY_PARAGRAPH;
-            case "SECTION" -> ai.pipestream.opensearch.v1.SemanticGranularity.SEMANTIC_GRANULARITY_SECTION;
-            case "DOCUMENT" -> ai.pipestream.opensearch.v1.SemanticGranularity.SEMANTIC_GRANULARITY_DOCUMENT;
-            default -> ai.pipestream.opensearch.v1.SemanticGranularity.SEMANTIC_GRANULARITY_UNSPECIFIED;
-        };
-    }
 }
