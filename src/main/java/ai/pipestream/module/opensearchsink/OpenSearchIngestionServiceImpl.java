@@ -67,37 +67,45 @@ public class OpenSearchIngestionServiceImpl extends MutinyOpenSearchIngestionSer
     @Override
     public Multi<StreamDocumentsResponse> streamDocuments(Multi<StreamDocumentsRequest> requestStream) {
         LOG.info("StreamDocuments called for OpenSearch sink module");
-        // High-throughput path: stream directly to manager
-        Multi<ai.pipestream.opensearch.v1.StreamIndexDocumentsRequest> managerRequests = requestStream.onItem().transform(req -> {
-            try {
-                String documentType = req.getDocument().getSearchMetadata().getDocumentType();
-                String indexName = schemaManager.determineIndexName(documentType);
-                
-                LOG.debugf("Streaming document %s to manager for index %s", req.getDocument().getDocId(), indexName);
-                
-                ai.pipestream.opensearch.v1.OpenSearchDocument osDoc = documentConverter.convertToOpenSearchDocument(req.getDocument());
-                
-                var builder = ai.pipestream.opensearch.v1.StreamIndexDocumentsRequest.newBuilder()
-                        .setRequestId(req.getRequestId())
-                        .setIndexName(indexName)
-                        .setDocument(osDoc)
-                        .setDocumentId(req.getDocument().getDocId());
-                
-                if (req.getDocument().hasOwnership()) {
-                    builder.setAccountId(req.getDocument().getOwnership().getAccountId());
-                    builder.setDatasourceId(req.getDocument().getOwnership().getDatasourceId());
-                }
-                
-                return builder.build();
-            } catch (Exception e) {
-                LOG.error("Failed to transform StreamDocumentsRequest for manager", e);
-                throw e;
-            }
-        });
 
-        return schemaManager.streamIndexDocumentsViaManager(managerRequests)
+        // Use group().intoLists().of(100) to ensure we provision the index for the first document of each micro-batch.
+        return requestStream.group().intoLists().of(100)
+                .onItem().transformToMultiAndConcatenate(batch -> {
+                    if (batch == null || batch.isEmpty()) return Multi.createFrom().empty();
+                    
+                    StreamDocumentsRequest first = batch.get(0);
+                    String documentType = first.getDocument().hasSearchMetadata() 
+                        ? first.getDocument().getSearchMetadata().getDocumentType() 
+                        : null;
+                    String indexName = schemaManager.determineIndexName(documentType);
+
+                    // Eagerly provision before streaming the batch
+                    return schemaManager.ensureIndexProvisioned(indexName, first.getDocument(), documentType)
+                            .onItem().transformToMulti(v -> Multi.createFrom().iterable(batch))
+                            .onItem().transform(req -> {
+                                String docType = req.getDocument().hasSearchMetadata() 
+                                    ? req.getDocument().getSearchMetadata().getDocumentType() 
+                                    : null;
+                                String idx = schemaManager.determineIndexName(docType);
+                                ai.pipestream.opensearch.v1.OpenSearchDocument osDoc = documentConverter.convertToOpenSearchDocument(req.getDocument());
+                                
+                                var builder = ai.pipestream.opensearch.v1.StreamIndexDocumentsRequest.newBuilder()
+                                        .setRequestId(req.getRequestId())
+                                        .setIndexName(idx)
+                                        .setDocument(osDoc)
+                                        .setDocumentId(req.getDocument().getDocId());
+                                
+                                if (req.getDocument().hasOwnership()) {
+                                    builder.setAccountId(req.getDocument().getOwnership().getAccountId());
+                                    builder.setDatasourceId(req.getDocument().getOwnership().getDatasourceId());
+                                }
+                                return builder.build();
+                            });
+                })
+                .onItem().transformToMultiAndConcatenate(managerRequest -> 
+                    schemaManager.streamIndexDocumentsViaManager(Multi.createFrom().item(managerRequest))
+                )
                 .onItem().transform(resp -> {
-                    LOG.debugf("Received streaming response from manager for req: %s, success: %b", resp.getRequestId(), resp.getSuccess());
                     String message = resp.getSuccess() ? resp.getMessage() : "Indexing failed: " + resp.getMessage();
                     return StreamDocumentsResponse.newBuilder()
                         .setRequestId(resp.getRequestId())
@@ -130,7 +138,6 @@ public class OpenSearchIngestionServiceImpl extends MutinyOpenSearchIngestionSer
             try {
                 String json = JsonFormat.printer().print(request.getConfig().getJsonConfig());
                 options = Optional.of(objectMapper.readValue(json, OpenSearchSinkOptions.class));
-                LOG.debugf("Parsed request configuration for index: %s", options.get().indexName());
             } catch (Exception e) {
                 LOG.error("Failed to parse Sink configuration from request", e);
                 return Uni.createFrom().item(ProcessDataResponse.newBuilder()
@@ -147,13 +154,13 @@ public class OpenSearchIngestionServiceImpl extends MutinyOpenSearchIngestionSer
         // 3. Determine index name and log strategy
         String indexName = options.map(OpenSearchSinkOptions::indexName)
                 .orElseGet(() -> schemaManager.determineIndexName(
-                        request.getDocument().getSearchMetadata().getDocumentType()));
+                        request.getDocument().hasSearchMetadata() ? request.getDocument().getSearchMetadata().getDocumentType() : null));
         String strategyName = options.map(o -> o.indexingStrategy() != null ? o.indexingStrategy().name() : "NESTED")
                 .orElse("NESTED");
         auditLogs.add(moduleLog("Indexing document " + docId + " to collection '" + indexName
                 + "' with strategy " + strategyName, LogLevel.LOG_LEVEL_INFO));
 
-        // 4. Index via manager — pass the already-converted OpenSearchDocument (no double conversion)
+        // 4. Index via manager — schemaManager.indexDocumentViaManager handles eager provisioning internally
         return schemaManager.indexDocumentViaManager(indexName, request.getDocument(), conversionResult.document(), options)
             .map(managerMessage -> {
                 long duration = System.currentTimeMillis() - startTime;
