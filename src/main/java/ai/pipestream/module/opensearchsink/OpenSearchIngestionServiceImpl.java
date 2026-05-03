@@ -31,12 +31,19 @@ import org.jboss.logging.Logger;
 import ai.pipestream.module.opensearchsink.service.ConversionResult;
 
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 /**
  * gRPC service implementation for the OpenSearch sink.
  * Handles both the ingestion stream and standard pipeline step processing.
+ *
+ * <p>{@link #processData(ProcessDataRequest)} is the production module-step entrypoint
+ * used by the engine. {@link #streamDocuments(Multi)} is an experimental direct-ingestion
+ * path for load testing and future transport work; it is not currently wired into normal
+ * DAG execution.
  */
 @Singleton
 @GrpcService
@@ -66,45 +73,18 @@ public class OpenSearchIngestionServiceImpl extends MutinyOpenSearchIngestionSer
 
     @Override
     public Multi<StreamDocumentsResponse> streamDocuments(Multi<StreamDocumentsRequest> requestStream) {
-        LOG.info("StreamDocuments called for OpenSearch sink module");
+        LOG.info("Experimental StreamDocuments called for OpenSearch sink module");
 
-        // Use group().intoLists().of(100) to ensure we provision the index for the first document of each micro-batch.
         return requestStream.group().intoLists().of(100)
                 .onItem().transformToMultiAndConcatenate(batch -> {
                     if (batch == null || batch.isEmpty()) return Multi.createFrom().empty();
-                    
-                    StreamDocumentsRequest first = batch.get(0);
-                    String documentType = first.getDocument().hasSearchMetadata() 
-                        ? first.getDocument().getSearchMetadata().getDocumentType() 
-                        : null;
-                    String indexName = schemaManager.determineIndexName(documentType);
 
-                    // Eagerly provision before streaming the batch
-                    return schemaManager.ensureIndexProvisioned(indexName, first.getDocument(), documentType)
-                            .onItem().transformToMulti(v -> Multi.createFrom().iterable(batch))
-                            .onItem().transform(req -> {
-                                String docType = req.getDocument().hasSearchMetadata() 
-                                    ? req.getDocument().getSearchMetadata().getDocumentType() 
-                                    : null;
-                                String idx = schemaManager.determineIndexName(docType);
-                                ai.pipestream.opensearch.v1.OpenSearchDocument osDoc = documentConverter.convertToOpenSearchDocument(req.getDocument());
-                                
-                                var builder = ai.pipestream.opensearch.v1.StreamIndexDocumentsRequest.newBuilder()
-                                        .setRequestId(req.getRequestId())
-                                        .setIndexName(idx)
-                                        .setDocument(osDoc)
-                                        .setDocumentId(req.getDocument().getDocId());
-                                
-                                if (req.getDocument().hasOwnership()) {
-                                    builder.setAccountId(req.getDocument().getOwnership().getAccountId());
-                                    builder.setDatasourceId(req.getDocument().getOwnership().getDatasourceId());
-                                }
-                                return builder.build();
-                            });
+                    return provisionBatch(batch)
+                            .onItem().transformToMulti(v -> schemaManager.streamIndexDocumentsViaManager(
+                                    Multi.createFrom().iterable(batch)
+                                            .onItem().transform(this::toManagerRequest)))
+                            .onFailure().recoverWithMulti(t -> failedBatchResponses(batch, t));
                 })
-                .onItem().transformToMultiAndConcatenate(managerRequest -> 
-                    schemaManager.streamIndexDocumentsViaManager(Multi.createFrom().item(managerRequest))
-                )
                 .onItem().transform(resp -> {
                     String message = resp.getSuccess() ? resp.getMessage() : "Indexing failed: " + resp.getMessage();
                     return StreamDocumentsResponse.newBuilder()
@@ -116,6 +96,66 @@ public class OpenSearchIngestionServiceImpl extends MutinyOpenSearchIngestionSer
                 })
                 .onFailure().invoke(t -> LOG.error("Stream to manager failed", t));
     }
+
+    private Uni<Void> provisionBatch(List<StreamDocumentsRequest> batch) {
+        Map<String, ProvisioningTarget> targets = new LinkedHashMap<>();
+        for (StreamDocumentsRequest req : batch) {
+            String documentType = documentType(req);
+            String indexName = schemaManager.determineIndexName(documentType);
+            String cacheKey = schemaManager.provisioningCacheKey(indexName, req.getDocument());
+            if (cacheKey != null) {
+                targets.putIfAbsent(cacheKey, new ProvisioningTarget(indexName, req.getDocument(), documentType));
+            }
+        }
+        if (targets.isEmpty()) {
+            return Uni.createFrom().voidItem();
+        }
+        List<Uni<Void>> provisioningCalls = targets.values().stream()
+                .map(target -> schemaManager.ensureIndexProvisioned(
+                        target.indexName(), target.document(), target.documentType()))
+                .toList();
+        return Uni.combine().all().unis(provisioningCalls).discardItems().replaceWithVoid();
+    }
+
+    private ai.pipestream.opensearch.v1.StreamIndexDocumentsRequest toManagerRequest(StreamDocumentsRequest req) {
+        String docType = documentType(req);
+        String indexName = schemaManager.determineIndexName(docType);
+        ai.pipestream.opensearch.v1.OpenSearchDocument osDoc = documentConverter.convertToOpenSearchDocument(req.getDocument());
+
+        LOG.debugf("Streaming document %s to manager index %s", req.getDocument().getDocId(), indexName);
+
+        var builder = ai.pipestream.opensearch.v1.StreamIndexDocumentsRequest.newBuilder()
+                .setRequestId(req.getRequestId())
+                .setIndexName(indexName)
+                .setDocument(osDoc)
+                .setDocumentId(req.getDocument().getDocId());
+
+        if (req.getDocument().hasOwnership()) {
+            builder.setAccountId(req.getDocument().getOwnership().getAccountId());
+            builder.setDatasourceId(req.getDocument().getOwnership().getDatasourceId());
+        }
+        return builder.build();
+    }
+
+    private Multi<ai.pipestream.opensearch.v1.StreamIndexDocumentsResponse> failedBatchResponses(
+            List<StreamDocumentsRequest> batch, Throwable failure) {
+        String message = failure.getMessage() != null ? failure.getMessage() : failure.toString();
+        return Multi.createFrom().iterable(batch)
+                .onItem().transform(req -> ai.pipestream.opensearch.v1.StreamIndexDocumentsResponse.newBuilder()
+                        .setRequestId(req.getRequestId())
+                        .setDocumentId(req.getDocument().getDocId())
+                        .setSuccess(false)
+                        .setMessage(message)
+                        .build());
+    }
+
+    private static String documentType(StreamDocumentsRequest req) {
+        return req.getDocument().hasSearchMetadata()
+                ? req.getDocument().getSearchMetadata().getDocumentType()
+                : null;
+    }
+
+    private record ProvisioningTarget(String indexName, ai.pipestream.data.v1.PipeDoc document, String documentType) {}
 
     @Override
     public Uni<ProcessDataResponse> processData(ProcessDataRequest request) {
@@ -202,7 +242,7 @@ public class OpenSearchIngestionServiceImpl extends MutinyOpenSearchIngestionSer
                 .setModuleName("opensearch-sink")
                 .setVersion(buildInfoProvider.getVersion())
                 .setDisplayName("OpenSearch Sink")
-                .setDescription("OpenSearch vector indexing sink with organic schema management")
+                .setDescription("OpenSearch vector indexing sink with organic schema management. Standard pipeline execution uses processData; StreamDocuments is experimental.")
                 .putAllMetadata(buildInfoProvider.registrationMetadata())
                 .setHealthCheckPassed(true)
                 .setHealthCheckMessage("OpenSearch sink module is healthy");

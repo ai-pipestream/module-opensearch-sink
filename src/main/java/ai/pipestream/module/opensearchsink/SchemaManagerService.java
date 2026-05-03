@@ -50,10 +50,20 @@ public class SchemaManagerService {
      */
     private Cache<String, Boolean> provisionedIndexCache;
 
+    /**
+     * Short-lived cache of provisioning failures. This keeps a broken manager/config
+     * from receiving one ProvisionIndex RPC per document while still retrying soon.
+     */
+    private Cache<String, RuntimeException> failedProvisioningCache;
+
     @PostConstruct
     void init() {
         provisionedIndexCache = Caffeine.newBuilder()
                 .expireAfterWrite(1, TimeUnit.HOURS)
+                .maximumSize(1000)
+                .build();
+        failedProvisioningCache = Caffeine.newBuilder()
+                .expireAfterWrite(30, TimeUnit.SECONDS)
                 .maximumSize(1000)
                 .build();
     }
@@ -72,15 +82,15 @@ public class SchemaManagerService {
             return Uni.createFrom().voidItem();
         }
 
-        Set<String> semanticConfigIds = document.getSearchMetadata().getSemanticResultsList().stream()
-                .map(ai.pipestream.data.v1.SemanticProcessingResult::getSemanticConfigId)
-                .filter(id -> id != null && !id.isBlank())
-                .collect(Collectors.toCollection(HashSet::new));
-
-        String cacheKey = indexName + "|" + semanticConfigIds.stream().sorted().collect(Collectors.joining(","));
+        Set<String> semanticConfigIds = semanticConfigIds(document);
+        String cacheKey = provisioningCacheKey(indexName, semanticConfigIds);
 
         if (provisionedIndexCache.getIfPresent(cacheKey) != null) {
             return Uni.createFrom().voidItem();
+        }
+        RuntimeException cachedFailure = failedProvisioningCache.getIfPresent(cacheKey);
+        if (cachedFailure != null) {
+            return Uni.createFrom().failure(cachedFailure);
         }
 
         LOG.infof("Eagerly provisioning index %s for semantic configs: %s", indexName, semanticConfigIds);
@@ -99,15 +109,35 @@ public class SchemaManagerService {
                     if (resp.getSuccess()) {
                         LOG.infof("Successfully provisioned index %s: %s", indexName, resp.getMessage());
                         provisionedIndexCache.put(cacheKey, true);
+                        failedProvisioningCache.invalidate(cacheKey);
                         return Uni.createFrom().voidItem();
                     } else {
-                        LOG.warnf("Index provisioning failed for %s: %s. Proceeding with organic registration.",
-                                indexName, resp.getMessage());
-                        return Uni.createFrom().voidItem();
+                        RuntimeException failure = new RuntimeException(
+                                "Index provisioning failed for " + indexName + ": " + resp.getMessage());
+                        failedProvisioningCache.put(cacheKey, failure);
+                        return Uni.createFrom().failure(failure);
                     }
                 })
                 .onFailure().invoke(t -> LOG.errorf(t, "Error calling ProvisionIndex for %s", indexName))
                 .replaceWithVoid();
+    }
+
+    public String provisioningCacheKey(String indexName, PipeDoc document) {
+        if (!document.hasSearchMetadata()) {
+            return null;
+        }
+        return provisioningCacheKey(indexName, semanticConfigIds(document));
+    }
+
+    private Set<String> semanticConfigIds(PipeDoc document) {
+        return document.getSearchMetadata().getSemanticResultsList().stream()
+                .map(ai.pipestream.data.v1.SemanticProcessingResult::getSemanticConfigId)
+                .filter(id -> id != null && !id.isBlank())
+                .collect(Collectors.toCollection(HashSet::new));
+    }
+
+    private String provisioningCacheKey(String indexName, Set<String> semanticConfigIds) {
+        return indexName + "|" + semanticConfigIds.stream().sorted().collect(Collectors.joining(","));
     }
 
     /**
