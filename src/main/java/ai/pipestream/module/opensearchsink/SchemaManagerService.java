@@ -4,6 +4,7 @@ import ai.pipestream.data.v1.PipeDoc;
 import ai.pipestream.opensearch.v1.*;
 import ai.pipestream.module.opensearchsink.config.IndexingStrategy;
 import ai.pipestream.module.opensearchsink.config.OpenSearchSinkOptions;
+import ai.pipestream.module.opensearchsink.grpc.GrpcFutures;
 import ai.pipestream.module.opensearchsink.service.ChunkConversionResult;
 import ai.pipestream.module.opensearchsink.service.ChunkDocumentConverter;
 import ai.pipestream.quarkus.dynamicgrpc.DynamicGrpcClientFactory;
@@ -34,6 +35,17 @@ import java.util.stream.Collectors;
 public class SchemaManagerService {
 
     private static final Logger LOG = Logger.getLogger(SchemaManagerService.class);
+
+    /**
+     * Single-thread-per-task virtual-thread executor used to host blocking
+     * gRPC calls outside the Vert.x event loop. Same shape as
+     * module-testing-sidecar's {@code BLOCKING_GRPC_EXECUTOR}. Required for
+     * the {@link GrpcFutures}-based plain-async-stub call sites that replace
+     * the Mutiny stubs prone to "CANCELLED: Context cancelled without error"
+     * when the caller's Vert.x context is invalidated mid-call.
+     */
+    private static final java.util.concurrent.ExecutorService BLOCKING_GRPC_EXECUTOR =
+            java.util.concurrent.Executors.newVirtualThreadPerTaskExecutor();
 
     @Inject
     ChunkDocumentConverter chunkDocumentConverter;
@@ -69,57 +81,27 @@ public class SchemaManagerService {
     }
 
     /**
-     * Ensures that the target index and all its semantic side indices are provisioned.
-     * This is an "Eager Provisioning" step that should be called before high-throughput indexing.
+     * No-op. The sink no longer eagerly provisions per doc — admin paths
+     * ({@code AssignSemanticConfigToIndex}, {@code BindVectorSetToIndex},
+     * {@code ProvisionIndex}) are the single source of truth for index
+     * topology, and they must be called before any doc is indexed. If the
+     * index/field isn't pre-provisioned, the manager-side
+     * {@code IndexKnnProvisioner.requireKnnField} fails the doc loud with a
+     * clear pointer.
      *
-     * @param indexName The target index name
-     * @param document The document whose semantic sets should be provisioned
-     * @param documentType Optional hint for schema generation
-     * @return A Uni that completes when provisioning is finished (or skipped due to cache hit)
+     * <p>Previously this method called {@code ProvisionIndex} per
+     * (index, semanticConfigs) pair on first encounter of each cache key,
+     * adding a gRPC round trip + a worst-case 2-4 cluster-state OpenSearch
+     * round trips to the first doc per (JVM, index, configs). On a cold
+     * cache that was the difference between "thousands of docs/sec" and
+     * "seconds per doc". Removed entirely.
+     *
+     * <p>Kept as a method (returning a completed Uni) so existing call
+     * sites compile without churn during the migration. Once all callers
+     * are removed it can be deleted.
      */
     public Uni<Void> ensureIndexProvisioned(String indexName, PipeDoc document, String documentType) {
-        if (!document.hasSearchMetadata()) {
-            return Uni.createFrom().voidItem();
-        }
-
-        Set<String> semanticConfigIds = semanticConfigIds(document);
-        String cacheKey = provisioningCacheKey(indexName, semanticConfigIds);
-
-        if (provisionedIndexCache.getIfPresent(cacheKey) != null) {
-            return Uni.createFrom().voidItem();
-        }
-        RuntimeException cachedFailure = failedProvisioningCache.getIfPresent(cacheKey);
-        if (cachedFailure != null) {
-            return Uni.createFrom().failure(cachedFailure);
-        }
-
-        LOG.infof("Eagerly provisioning index %s for semantic configs: %s", indexName, semanticConfigIds);
-
-        ProvisionIndexRequest.Builder requestBuilder = ProvisionIndexRequest.newBuilder()
-                .setIndexName(indexName)
-                .addAllSemanticConfigIds(semanticConfigIds);
-
-        if (documentType != null && !documentType.isBlank()) {
-            requestBuilder.setDocumentType(documentType);
-        }
-
-        return grpcClientFactory.getClient(managerServiceName, MutinyOpenSearchManagerServiceGrpc::newMutinyStub)
-                .flatMap(client -> client.provisionIndex(requestBuilder.build()))
-                .onItem().transformToUni(resp -> {
-                    if (resp.getSuccess()) {
-                        LOG.infof("Successfully provisioned index %s: %s", indexName, resp.getMessage());
-                        provisionedIndexCache.put(cacheKey, true);
-                        failedProvisioningCache.invalidate(cacheKey);
-                        return Uni.createFrom().voidItem();
-                    } else {
-                        RuntimeException failure = new RuntimeException(
-                                "Index provisioning failed for " + indexName + ": " + resp.getMessage());
-                        failedProvisioningCache.put(cacheKey, failure);
-                        return Uni.createFrom().failure(failure);
-                    }
-                })
-                .onFailure().invoke(t -> LOG.errorf(t, "Error calling ProvisionIndex for %s", indexName))
-                .replaceWithVoid();
+        return Uni.createFrom().voidItem();
     }
 
     public String provisioningCacheKey(String indexName, PipeDoc document) {
@@ -188,15 +170,36 @@ public class SchemaManagerService {
                                 chunkResult.chunkDocuments().size(), protoStrategy, document.getDocId());
                     }
 
-                    return grpcClientFactory.getClient(managerServiceName, MutinyOpenSearchManagerServiceGrpc::newMutinyStub)
-                            .flatMap(client -> client.indexDocument(requestBuilder.build()))
-                            .onItem().transformToUni(resp -> {
-                                if (resp.getSuccess()) {
-                                    return Uni.createFrom().item(resp.getMessage());
-                                } else {
-                                    return Uni.createFrom().failure(new RuntimeException(resp.getMessage()));
+                    // Plain async stub + GrpcFutures + virtual thread.
+                    // The Mutiny variant of this call is the one that surfaced
+                    // "CANCELLED: io.grpc.Context was cancelled without error"
+                    // in the e2e test — the engine cancels the worker context
+                    // mid-call, the Mutiny adapter loses the terminal event,
+                    // and the doc is reported as failed even though
+                    // upstream chunking + embedding completed normally.
+                    final IndexDocumentRequest indexRequest = requestBuilder.build();
+                    return Uni.createFrom().<String>item(() -> {
+                                OpenSearchManagerServiceGrpc.OpenSearchManagerServiceStub stub =
+                                        grpcClientFactory.getAsyncClient(managerServiceName,
+                                                OpenSearchManagerServiceGrpc::newStub);
+                                IndexDocumentResponse resp;
+                                try {
+                                    resp = GrpcFutures.<IndexDocumentResponse>unary(observer ->
+                                            stub.indexDocument(indexRequest, observer)).get();
+                                } catch (java.util.concurrent.ExecutionException e) {
+                                    Throwable cause = e.getCause() != null ? e.getCause() : e;
+                                    if (cause instanceof RuntimeException re) throw re;
+                                    throw new RuntimeException(cause);
+                                } catch (InterruptedException e) {
+                                    Thread.currentThread().interrupt();
+                                    throw new RuntimeException("Interrupted calling IndexDocument", e);
                                 }
-                            });
+                                if (resp.getSuccess()) {
+                                    return resp.getMessage();
+                                }
+                                throw new RuntimeException(resp.getMessage());
+                            })
+                            .runSubscriptionOn(BLOCKING_GRPC_EXECUTOR);
                 });
     }
 
