@@ -200,8 +200,12 @@ public class OpenSearchIngestionServiceImpl extends MutinyOpenSearchIngestionSer
         auditLogs.add(moduleLog("Indexing document " + docId + " to collection '" + indexName
                 + "' with strategy " + strategyName, LogLevel.LOG_LEVEL_INFO));
 
-        // 4. Index via manager — schemaManager.indexDocumentViaManager handles eager provisioning internally
-        return schemaManager.indexDocumentViaManager(indexName, request.getDocument(), conversionResult.document(), options)
+        // 4. Index via manager — schemaManager.indexDocumentViaManager handles eager provisioning internally.
+        // Pass crawl_id through so the sink stamps it on the base + chunk indexed payloads,
+        // enabling per-run progress queries via GetCrawlIndexStats. Engine populates
+        // ServiceMetadata.crawl_id from PipeStream.metadata.crawl_id on every dispatch.
+        String crawlId = request.hasMetadata() ? request.getMetadata().getCrawlId() : "";
+        return schemaManager.indexDocumentViaManager(indexName, request.getDocument(), conversionResult.document(), options, crawlId)
             .map(managerMessage -> {
                 long duration = System.currentTimeMillis() - startTime;
                 LOG.infof("OpenSearch sink indexed docId=%s index=%s in %dms", docId, indexName, duration);

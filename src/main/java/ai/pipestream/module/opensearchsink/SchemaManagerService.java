@@ -140,12 +140,30 @@ public class SchemaManagerService {
      * Proxies the indexing request to the OpenSearch Manager.
      */
     public Uni<String> indexDocumentViaManager(String indexName, PipeDoc document, OpenSearchDocument osDoc, Optional<OpenSearchSinkOptions> options) {
+        return indexDocumentViaManager(indexName, document, osDoc, options, "");
+    }
+
+    /**
+     * Proxies the indexing request to the OpenSearch Manager, stamping the
+     * given crawl_id onto the indexed base document and every chunk so that
+     * downstream per-run progress queries (GetCrawlIndexStats) can filter
+     * by it. Empty crawlId is treated as "no stamp" — the field is left
+     * unset and the docs index without a crawl_id (legacy behavior).
+     */
+    public Uni<String> indexDocumentViaManager(String indexName, PipeDoc document, OpenSearchDocument osDoc,
+                                                Optional<OpenSearchSinkOptions> options, String crawlId) {
         String docType = document.hasSearchMetadata() ? document.getSearchMetadata().getDocumentType() : null;
+        // Stamp crawl_id on the base document up-front. The conversion path
+        // (DocumentConverterService) sees only PipeDoc and can't know about
+        // PipeStream metadata; the sink injects it here at the boundary.
+        final OpenSearchDocument stampedOsDoc = (crawlId == null || crawlId.isEmpty())
+                ? osDoc
+                : osDoc.toBuilder().setCrawlId(crawlId).build();
         return ensureIndexProvisioned(indexName, document, docType)
                 .flatMap(v -> {
                     IndexDocumentRequest.Builder requestBuilder = IndexDocumentRequest.newBuilder()
                             .setIndexName(indexName)
-                            .setDocument(osDoc)
+                            .setDocument(stampedOsDoc)
                             .setDocumentId(document.getDocId());
 
                     if (document.hasOwnership()) {
@@ -161,10 +179,18 @@ public class SchemaManagerService {
                             || protoStrategy == ai.pipestream.opensearch.v1.IndexingStrategy.INDEXING_STRATEGY_SEPARATE_INDICES) {
 
                         ChunkConversionResult chunkResult = chunkDocumentConverter.convertToChunks(
-                                document, osDoc, indexName, protoStrategy);
+                                document, stampedOsDoc, indexName, protoStrategy);
 
                         requestBuilder.setDocumentMap(chunkResult.documentMap());
-                        requestBuilder.addAllChunkDocuments(chunkResult.chunkDocuments());
+                        // Stamp crawl_id on every chunk so per-run progress queries
+                        // hit the side indices the same way they hit the base.
+                        if (crawlId != null && !crawlId.isEmpty()) {
+                            for (var chunk : chunkResult.chunkDocuments()) {
+                                requestBuilder.addChunkDocuments(chunk.toBuilder().setCrawlId(crawlId).build());
+                            }
+                        } else {
+                            requestBuilder.addAllChunkDocuments(chunkResult.chunkDocuments());
+                        }
 
                         LOG.infof("Enriched IndexDocumentRequest with %d chunk documents for strategy %s (doc %s)",
                                 chunkResult.chunkDocuments().size(), protoStrategy, document.getDocId());
