@@ -145,6 +145,9 @@ public class ChunkDocumentConverter {
         if (osDoc.hasNlpAnalysis()) {
             mapBuilder.setNlpAnalysis(osDoc.getNlpAnalysis());
         }
+        if (osDoc.hasCrawlId()) {
+            mapBuilder.setCrawlId(osDoc.getCrawlId());
+        }
 
         // Set ACL
         mapBuilder.setAcl(acl);
