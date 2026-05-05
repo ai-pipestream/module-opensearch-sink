@@ -111,19 +111,29 @@ public class DocumentConverterService {
         int totalDeduplicated = 0;
         int setsProcessed = 0;
 
+        int chunkerOnlySetsSkipped = 0;
         for (SemanticProcessingResult result : document.getSearchMetadata().getSemanticResultsList()) {
             String chunkConfigId = result.getChunkConfigId();
             String embeddingId = result.getEmbeddingConfigId();
             String sourceFieldName = result.getSourceFieldName();
             String resultSetName = result.getResultSetName();
 
-            if (chunkConfigId == null || chunkConfigId.isEmpty() ||
-                embeddingId == null || embeddingId.isEmpty()) {
+            if (chunkConfigId == null || chunkConfigId.isEmpty()) {
                 String setDesc = resultSetName != null && !resultSetName.isEmpty() ? resultSetName : "(unnamed)";
                 auditLogs.add("Warning: Skipping semantic result set '" + setDesc
-                        + "' — missing chunk_config_id or embedding_config_id");
-                LOG.warnf("Skipping semantic result set '%s' for doc %s: chunk_config_id='%s', embedding_config_id='%s'",
-                        setDesc, document.getDocId(), chunkConfigId, embeddingId);
+                        + "' — missing chunk_config_id");
+                LOG.warnf("Skipping semantic result set '%s' for doc %s: missing chunk_config_id",
+                        setDesc, document.getDocId());
+                continue;
+            }
+
+            // Chunker-only graphs (no embedder downstream) produce result sets with
+            // chunk_config_id but no embedding_config_id. We don't index those as
+            // SemanticVectorSets — there's no vector to score against and no point
+            // joining text-only chunk rows to the parent doc; the base document's
+            // body field already carries the full searchable text. Silently drop.
+            if (embeddingId == null || embeddingId.isEmpty()) {
+                chunkerOnlySetsSkipped++;
                 continue;
             }
 
@@ -201,6 +211,10 @@ public class DocumentConverterService {
                 + " chunks across " + setsProcessed + " vector sets");
         if (totalChunksDropped > 0) {
             auditLogs.add("Warning: " + totalChunksDropped + " total chunks had no vectors and were excluded from indexing");
+        }
+        if (chunkerOnlySetsSkipped > 0) {
+            auditLogs.add("Skipped " + chunkerOnlySetsSkipped
+                    + " chunker-only result set(s) (no embedding model); base document still indexed");
         }
         if (totalDeduplicated > 0) {
             auditLogs.add("Deduplication removed " + totalDeduplicated + " total duplicate embeddings");
