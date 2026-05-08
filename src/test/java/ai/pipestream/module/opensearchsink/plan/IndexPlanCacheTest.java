@@ -65,7 +65,7 @@ public class IndexPlanCacheTest {
     void readyPlanResolvesAndIsCached() {
         fakePlans.put("p1", IndexPlanCache.FetchOutcome.found(plan("p1", IndexPlanStatus.INDEX_PLAN_STATUS_READY)));
 
-        List<ResolvedPlan> resolved = cache.resolve(List.of("p1")).await().indefinitely();
+        List<ResolvedPlan> resolved = cache.resolve(List.of("p1"));
 
         assertThat(resolved)
                 .as("READY plan should resolve into a single ResolvedPlan with the expected fields")
@@ -88,8 +88,8 @@ public class IndexPlanCacheTest {
             return IndexPlanCache.FetchOutcome.found(plan(id, IndexPlanStatus.INDEX_PLAN_STATUS_READY));
         });
 
-        cache.resolve(List.of("p1")).await().indefinitely();
-        cache.resolve(List.of("p1")).await().indefinitely();
+        cache.resolve(List.of("p1"));
+        cache.resolve(List.of("p1"));
 
         assertThat(calls.get())
                 .as("a second resolve of the same plan id must be served from cache (one fetcher call only)")
@@ -103,7 +103,7 @@ public class IndexPlanCacheTest {
                         .setLastError("knn provisioning blew up")
                         .build()));
 
-        assertThatThrownBy(() -> cache.resolve(List.of("p-bad")).await().indefinitely())
+        assertThatThrownBy(() -> cache.resolve(List.of("p-bad")))
                 .as("FAILED plan must fail loud naming the plan id and status")
                 .isInstanceOf(PlanResolutionException.class)
                 .hasMessageContaining("p-bad")
@@ -116,7 +116,7 @@ public class IndexPlanCacheTest {
         fakePlans.put("p-pend", IndexPlanCache.FetchOutcome.found(
                 plan("p-pend", IndexPlanStatus.INDEX_PLAN_STATUS_PENDING)));
 
-        assertThatThrownBy(() -> cache.resolve(List.of("p-pend")).await().indefinitely())
+        assertThatThrownBy(() -> cache.resolve(List.of("p-pend")))
                 .as("PENDING plan is not READY — sink must reject")
                 .isInstanceOf(PlanResolutionException.class)
                 .hasMessageContaining("p-pend")
@@ -126,7 +126,7 @@ public class IndexPlanCacheTest {
     @Test
     void missingPlanFailsLoudWithPlanIdNamed() {
         // No entry for "p-missing" → fetcher returns Missing()
-        assertThatThrownBy(() -> cache.resolve(List.of("p-missing")).await().indefinitely())
+        assertThatThrownBy(() -> cache.resolve(List.of("p-missing")))
                 .as("missing plan id must fail loud and name the offending id")
                 .isInstanceOf(PlanResolutionException.class)
                 .hasMessageContaining("missing")
@@ -138,7 +138,7 @@ public class IndexPlanCacheTest {
         fakePlans.put("p-ok", IndexPlanCache.FetchOutcome.found(plan("p-ok", IndexPlanStatus.INDEX_PLAN_STATUS_READY)));
         // p-missing not registered → fetcher returns Missing()
 
-        assertThatThrownBy(() -> cache.resolve(List.of("p-ok", "p-missing")).await().indefinitely())
+        assertThatThrownBy(() -> cache.resolve(List.of("p-ok", "p-missing")))
                 .as("a single missing plan must reject the whole batch (no partial success)")
                 .isInstanceOf(PlanResolutionException.class)
                 .hasMessageContaining("p-missing");
@@ -150,7 +150,7 @@ public class IndexPlanCacheTest {
         fakePlans.put("p-failed", IndexPlanCache.FetchOutcome.found(plan("p-failed", IndexPlanStatus.INDEX_PLAN_STATUS_FAILED)));
         // p-missing → Missing()
 
-        assertThatThrownBy(() -> cache.resolve(List.of("p-ok", "p-failed", "p-missing")).await().indefinitely())
+        assertThatThrownBy(() -> cache.resolve(List.of("p-ok", "p-failed", "p-missing")))
                 .as("a single PlanResolutionException must enumerate all offenders so operators see the full picture")
                 .isInstanceOf(PlanResolutionException.class)
                 .hasMessageContaining("p-failed")
@@ -159,7 +159,7 @@ public class IndexPlanCacheTest {
 
     @Test
     void emptyPlanIdsFailsLoud() {
-        assertThatThrownBy(() -> cache.resolve(List.of()).await().indefinitely())
+        assertThatThrownBy(() -> cache.resolve(List.of()))
                 .as("empty plan_ids must reject — sink config requires at least one plan")
                 .isInstanceOf(PlanResolutionException.class)
                 .hasMessageContaining("plan_ids is empty");
@@ -167,7 +167,7 @@ public class IndexPlanCacheTest {
 
     @Test
     void nullPlanIdsFailsLoud() {
-        assertThatThrownBy(() -> cache.resolve(null).await().indefinitely())
+        assertThatThrownBy(() -> cache.resolve(null))
                 .as("null plan_ids must reject — sink config requires at least one plan")
                 .isInstanceOf(PlanResolutionException.class)
                 .hasMessageContaining("plan_ids is empty");
@@ -175,7 +175,7 @@ public class IndexPlanCacheTest {
 
     @Test
     void blankPlanIdInListFailsLoud() {
-        assertThatThrownBy(() -> cache.resolve(List.of("   ")).await().indefinitely())
+        assertThatThrownBy(() -> cache.resolve(List.of("   ")))
                 .as("blank plan id must reject — every plan id must be a non-empty string")
                 .isInstanceOf(PlanResolutionException.class)
                 .hasMessageContaining("blank");
@@ -187,7 +187,7 @@ public class IndexPlanCacheTest {
         fakePlans.put("p2", IndexPlanCache.FetchOutcome.found(plan("p2", IndexPlanStatus.INDEX_PLAN_STATUS_READY)));
         fakePlans.put("p3", IndexPlanCache.FetchOutcome.found(plan("p3", IndexPlanStatus.INDEX_PLAN_STATUS_READY)));
 
-        List<ResolvedPlan> resolved = cache.resolve(List.of("p3", "p1", "p2")).await().indefinitely();
+        List<ResolvedPlan> resolved = cache.resolve(List.of("p3", "p1", "p2"));
 
         assertThat(resolved)
                 .as("resolved list must preserve input order so plan-by-index access is meaningful")

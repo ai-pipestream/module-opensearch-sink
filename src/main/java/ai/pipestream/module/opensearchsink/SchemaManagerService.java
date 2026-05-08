@@ -1,107 +1,102 @@
 package ai.pipestream.module.opensearchsink;
 
 import ai.pipestream.data.v1.PipeDoc;
-import ai.pipestream.opensearch.v1.*;
+import ai.pipestream.opensearch.v1.OpenSearchDocument;
+import ai.pipestream.opensearch.v1.OpenSearchManagerServiceGrpc;
+import ai.pipestream.opensearch.v1.StreamIndexDocumentsRequest;
+import ai.pipestream.opensearch.v1.StreamIndexDocumentsResponse;
 import ai.pipestream.module.opensearchsink.config.OpenSearchSinkOptions;
-import ai.pipestream.module.opensearchsink.grpc.GrpcFutures;
 import ai.pipestream.module.opensearchsink.plan.ResolvedPlan;
 import ai.pipestream.module.opensearchsink.service.ChunkConversionResult;
 import ai.pipestream.module.opensearchsink.service.ChunkDocumentConverter;
-import ai.pipestream.quarkus.dynamicgrpc.DynamicGrpcClientFactory;
-import com.github.benmanes.caffeine.cache.Cache;
-import com.github.benmanes.caffeine.cache.Caffeine;
-import io.smallrye.mutiny.Uni;
-import io.smallrye.mutiny.Multi;
+import io.grpc.Channel;
+import io.grpc.Status;
+import io.grpc.StatusRuntimeException;
+import io.grpc.stub.StreamObserver;
+import io.quarkus.grpc.GrpcClient;
 import jakarta.annotation.PostConstruct;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
-import org.eclipse.microprofile.config.inject.ConfigProperty;
 import org.jboss.logging.Logger;
 
 import java.util.HashSet;
-import java.util.List;
 import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.stream.Collectors;
 
 /**
- * Service responsible for managing OpenSearch index schemas via the OpenSearch Manager.
- * Delegates strictly to OpenSearchManagerService for organic registration and indexing.
- * Uses DynamicGrpcClientFactory for Consul-based service discovery (consistent with engine pattern).
+ * Service responsible for proxying indexing requests to the OpenSearch Manager.
+ * <p>
+ * The sink no longer eagerly provisions indices — the admin paths
+ * ({@code AssignSemanticConfigToIndex}, {@code BindVectorSetToIndex},
+ * {@code ProvisionIndex}) are the single source of truth for index topology
+ * and they must be called before any document is indexed. If the index/field
+ * isn't pre-provisioned, the manager-side {@code IndexKnnProvisioner} fails
+ * the doc loud with a clear pointer.
+ * <p>
+ * Sink → manager indexing uses the bidi streaming RPC
+ * {@code StreamIndexDocuments} on a per-call basis: open a stream, send one
+ * request, await one response, close the stream. Plain async-callback gRPC
+ * stub on a virtual thread; no Mutiny on the hot path.
  */
 @ApplicationScoped
 public class SchemaManagerService {
 
     private static final Logger LOG = Logger.getLogger(SchemaManagerService.class);
 
-    /**
-     * Single-thread-per-task virtual-thread executor used to host blocking
-     * gRPC calls outside the Vert.x event loop. Same shape as
-     * module-testing-sidecar's {@code BLOCKING_GRPC_EXECUTOR}. Required for
-     * the {@link GrpcFutures}-based plain-async-stub call sites that replace
-     * the Mutiny stubs prone to "CANCELLED: Context cancelled without error"
-     * when the caller's Vert.x context is invalidated mid-call.
-     */
-    private static final java.util.concurrent.ExecutorService BLOCKING_GRPC_EXECUTOR =
-            java.util.concurrent.Executors.newVirtualThreadPerTaskExecutor();
+    /** Per-call deadline on the bidi sink→manager round-trip. */
+    private static final long INDEX_RPC_TIMEOUT_SECONDS = 30L;
 
     @Inject
     ChunkDocumentConverter chunkDocumentConverter;
 
+    /**
+     * Stork-discovered managed channel injected by Quarkus. Quarkus's
+     * {@code @GrpcClient} only injects Mutiny stubs, blocking stubs, or
+     * channels — so we take the channel and build a plain async-callback
+     * stub ourselves at startup.
+     */
     @Inject
-    DynamicGrpcClientFactory grpcClientFactory;
-
-    @ConfigProperty(name = "module.opensearch-sink.manager-service", defaultValue = "opensearch-manager")
-    String managerServiceName;
+    @GrpcClient("opensearch-manager")
+    Channel managerChannel;
 
     /**
-     * Cache of indices that have been successfully provisioned during this lifecycle.
-     * Key is "indexName|configId1,configId2,...".
+     * Plain async-callback stub for the bidi {@code StreamIndexDocuments} call.
+     * Built from {@link #managerChannel} in {@link #init()}; package-private
+     * so tests can substitute a fake.
      */
-    private Cache<String, Boolean> provisionedIndexCache;
-
-    /**
-     * Short-lived cache of provisioning failures. This keeps a broken manager/config
-     * from receiving one ProvisionIndex RPC per document while still retrying soon.
-     */
-    private Cache<String, RuntimeException> failedProvisioningCache;
+    OpenSearchManagerServiceGrpc.OpenSearchManagerServiceStub managerStub;
 
     @PostConstruct
     void init() {
-        provisionedIndexCache = Caffeine.newBuilder()
-                .expireAfterWrite(1, TimeUnit.HOURS)
-                .maximumSize(1000)
-                .build();
-        failedProvisioningCache = Caffeine.newBuilder()
-                .expireAfterWrite(30, TimeUnit.SECONDS)
-                .maximumSize(1000)
-                .build();
+        if (managerStub == null && managerChannel != null) {
+            managerStub = OpenSearchManagerServiceGrpc.newStub(managerChannel);
+        }
     }
 
     /**
-     * No-op. The sink no longer eagerly provisions per doc — admin paths
-     * ({@code AssignSemanticConfigToIndex}, {@code BindVectorSetToIndex},
-     * {@code ProvisionIndex}) are the single source of truth for index
-     * topology, and they must be called before any doc is indexed. If the
-     * index/field isn't pre-provisioned, the manager-side
-     * {@code IndexKnnProvisioner.requireKnnField} fails the doc loud with a
-     * clear pointer.
-     *
-     * <p>Previously this method called {@code ProvisionIndex} per
-     * (index, semanticConfigs) pair on first encounter of each cache key,
-     * adding a gRPC round trip + a worst-case 2-4 cluster-state OpenSearch
-     * round trips to the first doc per (JVM, index, configs). On a cold
-     * cache that was the difference between "thousands of docs/sec" and
-     * "seconds per doc". Removed entirely.
-     *
-     * <p>Kept as a method (returning a completed Uni) so existing call
-     * sites compile without churn during the migration. Once all callers
-     * are removed it can be deleted.
+     * Determine the index name for a document type on the experimental
+     * streaming ingestion path. This is the only path that still needs a
+     * "type → name" mapping; the production {@code processData} path routes
+     * via {@link ResolvedPlan#indexName()} from the IndexPlan registry and
+     * does not call this method.
      */
-    public Uni<Void> ensureIndexProvisioned(String indexName, PipeDoc document, String documentType) {
-        return Uni.createFrom().voidItem();
+    public String determineIndexName(String documentType) {
+        if (documentType == null || documentType.isEmpty()) {
+            return "pipeline-documents";
+        }
+        return "pipeline-" + documentType.toLowerCase();
     }
 
+    /**
+     * Build a stable-ish provisioning cache key. Retained because tests still
+     * use it to assert per-(index, semantic-config-set) bookkeeping in the
+     * streaming path; the sink itself no longer caches provisioning state.
+     */
     public String provisioningCacheKey(String indexName, PipeDoc document) {
         if (!document.hasSearchMetadata()) {
             return null;
@@ -121,138 +116,232 @@ public class SchemaManagerService {
     }
 
     /**
-     * Determines the index name for a given document type.
-     * Uses a simple naming convention: "pipeline-{documentType}"
-     *
-     * @param documentType The document type (e.g., "article", "test-doc")
-     * @return The index name
+     * Provisioning hook retained for the streaming path. Default implementation
+     * is a no-op; tests override this to assert per-(index, configs)
+     * provisioning bookkeeping or to inject failures.
      */
-    public String determineIndexName(String documentType) {
-        if (documentType == null || documentType.isEmpty()) {
-            return "pipeline-documents";
-        }
-        return "pipeline-" + documentType.toLowerCase();
+    public void ensureIndexProvisioned(String indexName, PipeDoc document, String documentType) {
+        // no-op in production; admin paths own provisioning
     }
 
     /**
-     * Proxies the indexing request to the OpenSearch Manager, scoped to a
-     * single {@link ResolvedPlan}. The plan dictates the physical index name
-     * and the indexing strategy used to fan documents out into chunk / vector
-     * indices; the sink no longer carries either field on its config.
+     * Index a single document via the OpenSearch Manager, scoped to a single
+     * {@link ResolvedPlan}. The plan dictates the physical index name and the
+     * indexing strategy used to fan documents out into chunk / vector indices;
+     * the sink no longer carries either field on its config.
      */
-    public Uni<String> indexDocumentViaManager(ResolvedPlan plan, PipeDoc document, OpenSearchDocument osDoc,
-                                                OpenSearchSinkOptions options) {
+    public String indexDocumentViaManager(ResolvedPlan plan, PipeDoc document, OpenSearchDocument osDoc,
+                                          OpenSearchSinkOptions options) {
         return indexDocumentViaManager(plan, document, osDoc, options, "");
     }
 
     /**
-     * Proxies the indexing request to the OpenSearch Manager, stamping the
-     * given crawl_id onto the indexed base document and every chunk so that
-     * downstream per-run progress queries (GetCrawlIndexStats) can filter
-     * by it. Empty crawlId is treated as "no stamp" — the field is left
-     * unset and the docs index without a crawl_id (legacy behavior).
+     * Index a single document via the OpenSearch Manager, stamping the given
+     * {@code crawlId} onto the indexed base document and every chunk so that
+     * downstream per-run progress queries (GetCrawlIndexStats) can filter by
+     * it. Empty crawlId is treated as "no stamp" — the field is left unset
+     * and the docs index without a crawl_id (legacy behavior).
      * <p>
      * The {@code plan} carries the index name and indexing strategy. Routing
      * lives entirely in the plan; the sink's only contribution is the doc
-     * payload + crawl_id stamping. {@code options} is currently unused
-     * inside this method (BatchOptions belong to the streaming path) and is
-     * carried only for forward-compatibility with future per-call knobs.
+     * payload + crawl_id stamping. {@code options} is currently unused inside
+     * this method (BatchOptions belong to the streaming path) and is carried
+     * only for forward-compatibility with future per-call knobs.
+     * <p>
+     * Wire-level call is the bidi {@code StreamIndexDocuments} RPC: open the
+     * stream, send one request, await one response, close the stream.
      */
     @SuppressWarnings("unused")
-    public Uni<String> indexDocumentViaManager(ResolvedPlan plan, PipeDoc document, OpenSearchDocument osDoc,
-                                                OpenSearchSinkOptions options, String crawlId) {
+    public String indexDocumentViaManager(ResolvedPlan plan, PipeDoc document, OpenSearchDocument osDoc,
+                                          OpenSearchSinkOptions options, String crawlId) {
         String indexName = plan.indexName();
-        String docType = document.hasSearchMetadata() ? document.getSearchMetadata().getDocumentType() : null;
         // Stamp crawl_id on the base document up-front. The conversion path
         // (DocumentConverterService) sees only PipeDoc and can't know about
         // PipeStream metadata; the sink injects it here at the boundary.
         final OpenSearchDocument stampedOsDoc = (crawlId == null || crawlId.isEmpty())
                 ? osDoc
                 : osDoc.toBuilder().setCrawlId(crawlId).build();
-        return ensureIndexProvisioned(indexName, document, docType)
-                .flatMap(v -> {
-                    IndexDocumentRequest.Builder requestBuilder = IndexDocumentRequest.newBuilder()
-                            .setIndexName(indexName)
-                            .setDocument(stampedOsDoc)
-                            .setDocumentId(document.getDocId());
 
-                    if (document.hasOwnership()) {
-                        requestBuilder.setAccountId(document.getOwnership().getAccountId());
-                        requestBuilder.setDatasourceId(document.getOwnership().getDatasourceId());
-                    }
+        StreamIndexDocumentsRequest.Builder requestBuilder = StreamIndexDocumentsRequest.newBuilder()
+                .setRequestId(UUID.randomUUID().toString())
+                .setIndexName(indexName)
+                .setDocument(stampedOsDoc)
+                .setDocumentId(document.getDocId());
 
-                    ai.pipestream.opensearch.v1.IndexingStrategy protoStrategy = plan.strategy();
-                    if (protoStrategy == null
-                            || protoStrategy == ai.pipestream.opensearch.v1.IndexingStrategy.INDEXING_STRATEGY_UNSPECIFIED) {
-                        // A READY plan must carry a concrete strategy. Coercing UNSPECIFIED
-                        // here would silently misroute documents to the wrong index shape;
-                        // refuse loud so the operator sees the misconfigured plan id.
-                        throw new IllegalStateException(
-                                "IndexPlan '" + plan.id() + "' returned UNSPECIFIED indexing_strategy on a READY plan — "
-                                        + "manager contract violation; plan is misconfigured");
-                    }
-                    requestBuilder.setIndexingStrategy(protoStrategy);
+        if (document.hasOwnership()) {
+            requestBuilder.setAccountId(document.getOwnership().getAccountId());
+            requestBuilder.setDatasourceId(document.getOwnership().getDatasourceId());
+        }
 
-                    if (protoStrategy == ai.pipestream.opensearch.v1.IndexingStrategy.INDEXING_STRATEGY_CHUNK_COMBINED
-                            || protoStrategy == ai.pipestream.opensearch.v1.IndexingStrategy.INDEXING_STRATEGY_SEPARATE_INDICES) {
+        ai.pipestream.opensearch.v1.IndexingStrategy protoStrategy = plan.strategy();
+        if (protoStrategy == null
+                || protoStrategy == ai.pipestream.opensearch.v1.IndexingStrategy.INDEXING_STRATEGY_UNSPECIFIED) {
+            // A READY plan must carry a concrete strategy. Coercing UNSPECIFIED
+            // here would silently misroute documents to the wrong index shape;
+            // refuse loud so the operator sees the misconfigured plan id.
+            throw new IllegalStateException(
+                    "IndexPlan '" + plan.id() + "' returned UNSPECIFIED indexing_strategy on a READY plan — "
+                            + "manager contract violation; plan is misconfigured");
+        }
+        requestBuilder.setIndexingStrategy(protoStrategy);
 
-                        ChunkConversionResult chunkResult = chunkDocumentConverter.convertToChunks(
-                                document, stampedOsDoc, indexName, protoStrategy);
+        if (protoStrategy == ai.pipestream.opensearch.v1.IndexingStrategy.INDEXING_STRATEGY_CHUNK_COMBINED
+                || protoStrategy == ai.pipestream.opensearch.v1.IndexingStrategy.INDEXING_STRATEGY_SEPARATE_INDICES) {
 
-                        requestBuilder.setDocumentMap(chunkResult.documentMap());
-                        // Stamp crawl_id on every chunk so per-run progress queries
-                        // hit the side indices the same way they hit the base.
-                        if (crawlId != null && !crawlId.isEmpty()) {
-                            for (var chunk : chunkResult.chunkDocuments()) {
-                                requestBuilder.addChunkDocuments(chunk.toBuilder().setCrawlId(crawlId).build());
-                            }
-                        } else {
-                            requestBuilder.addAllChunkDocuments(chunkResult.chunkDocuments());
-                        }
+            ChunkConversionResult chunkResult = chunkDocumentConverter.convertToChunks(
+                    document, stampedOsDoc, indexName, protoStrategy);
 
-                        LOG.infof("Enriched IndexDocumentRequest with %d chunk documents for strategy %s (doc %s, plan %s)",
-                                chunkResult.chunkDocuments().size(), protoStrategy, document.getDocId(), plan.id());
-                    }
+            requestBuilder.setDocumentMap(chunkResult.documentMap());
+            // Stamp crawl_id on every chunk so per-run progress queries
+            // hit the side indices the same way they hit the base.
+            if (crawlId != null && !crawlId.isEmpty()) {
+                for (var chunk : chunkResult.chunkDocuments()) {
+                    requestBuilder.addChunkDocuments(chunk.toBuilder().setCrawlId(crawlId).build());
+                }
+            } else {
+                requestBuilder.addAllChunkDocuments(chunkResult.chunkDocuments());
+            }
 
-                    // Plain async stub + GrpcFutures + virtual thread.
-                    // The Mutiny variant of this call is the one that surfaced
-                    // "CANCELLED: io.grpc.Context was cancelled without error"
-                    // in the e2e test — the engine cancels the worker context
-                    // mid-call, the Mutiny adapter loses the terminal event,
-                    // and the doc is reported as failed even though
-                    // upstream chunking + embedding completed normally.
-                    final IndexDocumentRequest indexRequest = requestBuilder.build();
-                    return Uni.createFrom().<String>item(() -> {
-                                OpenSearchManagerServiceGrpc.OpenSearchManagerServiceStub stub =
-                                        grpcClientFactory.getAsyncClient(managerServiceName,
-                                                OpenSearchManagerServiceGrpc::newStub);
-                                IndexDocumentResponse resp;
-                                try {
-                                    resp = GrpcFutures.<IndexDocumentResponse>unary(observer ->
-                                            stub.indexDocument(indexRequest, observer)).get();
-                                } catch (java.util.concurrent.ExecutionException e) {
-                                    Throwable cause = e.getCause() != null ? e.getCause() : e;
-                                    if (cause instanceof RuntimeException re) throw re;
-                                    throw new RuntimeException(cause);
-                                } catch (InterruptedException e) {
-                                    Thread.currentThread().interrupt();
-                                    throw new RuntimeException("Interrupted calling IndexDocument", e);
-                                }
-                                if (resp.getSuccess()) {
-                                    return resp.getMessage();
-                                }
-                                throw new RuntimeException(resp.getMessage());
-                            })
-                            .runSubscriptionOn(BLOCKING_GRPC_EXECUTOR);
-                });
+            LOG.infof("Enriched StreamIndexDocumentsRequest with %d chunk documents for strategy %s (doc %s, plan %s)",
+                    chunkResult.chunkDocuments().size(), protoStrategy, document.getDocId(), plan.id());
+        }
+
+        StreamIndexDocumentsResponse response = streamOne(requestBuilder.build());
+        if (response.getSuccess()) {
+            return response.getMessage();
+        }
+        throw new RuntimeException(response.getMessage());
     }
 
     /**
-     * Proxies a stream of indexing requests to the OpenSearch Manager for high-throughput bulk ingestion.
+     * Stream a micro-batch of indexing requests to the manager via one bidi
+     * call: send every request, half-close, drain every response in order.
+     * The caller is expected to be on a virtual thread; this method blocks
+     * until the manager closes the stream or the per-call deadline expires.
+     * <p>
+     * Used by the experimental streaming ingestion path
+     * ({@code OpenSearchIngestionServiceImpl.streamDocuments}). Tests override
+     * this hook to record batch sizes without spinning up a real manager.
      */
-    public Multi<StreamIndexDocumentsResponse> streamIndexDocumentsViaManager(
-            Multi<StreamIndexDocumentsRequest> requests) {
-        return grpcClientFactory.getClient(managerServiceName, MutinyOpenSearchManagerServiceGrpc::newMutinyStub)
-                .onItem().transformToMulti(client -> client.streamIndexDocuments(requests));
+    public java.util.List<StreamIndexDocumentsResponse> streamIndexDocumentsViaManager(
+            java.util.List<StreamIndexDocumentsRequest> requests) {
+        if (requests == null || requests.isEmpty()) {
+            return java.util.List.of();
+        }
+        java.util.concurrent.BlockingQueue<Object> responses = new java.util.concurrent.LinkedBlockingQueue<>();
+        Object COMPLETE = new Object();
+        StreamObserver<StreamIndexDocumentsResponse> respObs = new StreamObserver<>() {
+            @Override public void onNext(StreamIndexDocumentsResponse v) { responses.add(v); }
+            @Override public void onError(Throwable t) { responses.add(t); }
+            @Override public void onCompleted() { responses.add(COMPLETE); }
+        };
+        StreamObserver<StreamIndexDocumentsRequest> reqObs = managerStub.streamIndexDocuments(respObs);
+        try {
+            for (StreamIndexDocumentsRequest req : requests) {
+                reqObs.onNext(req);
+            }
+            reqObs.onCompleted();
+        } catch (RuntimeException e) {
+            try {
+                reqObs.onError(e);
+            } catch (RuntimeException ignored) {
+                // already failed; surface the original
+            }
+            throw e;
+        }
+        java.util.List<StreamIndexDocumentsResponse> collected = new java.util.ArrayList<>(requests.size());
+        long deadlineNanos = System.nanoTime()
+                + java.util.concurrent.TimeUnit.SECONDS.toNanos(INDEX_RPC_TIMEOUT_SECONDS);
+        while (true) {
+            long remaining = deadlineNanos - System.nanoTime();
+            if (remaining <= 0) {
+                throw Status.DEADLINE_EXCEEDED
+                        .withDescription("timed out after " + INDEX_RPC_TIMEOUT_SECONDS
+                                + "s draining StreamIndexDocuments responses (got "
+                                + collected.size() + " of " + requests.size() + ")")
+                        .asRuntimeException();
+            }
+            Object next;
+            try {
+                next = responses.poll(remaining, java.util.concurrent.TimeUnit.NANOSECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw Status.CANCELLED.withCause(e)
+                        .withDescription("interrupted draining StreamIndexDocuments responses")
+                        .asRuntimeException();
+            }
+            if (next == null) continue;
+            if (next == COMPLETE) {
+                return collected;
+            }
+            if (next instanceof Throwable t) {
+                if (t instanceof StatusRuntimeException sre) throw sre;
+                if (t instanceof RuntimeException re) throw re;
+                throw new RuntimeException(t);
+            }
+            collected.add((StreamIndexDocumentsResponse) next);
+        }
+    }
+
+    /**
+     * Open a per-call bidi stream to the manager's {@code StreamIndexDocuments},
+     * send one request, await one response, close the stream. Plain blocking;
+     * the caller is expected to be on a virtual thread.
+     */
+    StreamIndexDocumentsResponse streamOne(StreamIndexDocumentsRequest request) {
+        CompletableFuture<StreamIndexDocumentsResponse> future = new CompletableFuture<>();
+        StreamObserver<StreamIndexDocumentsResponse> respObs = new StreamObserver<>() {
+            @Override
+            public void onNext(StreamIndexDocumentsResponse v) {
+                future.complete(v);
+            }
+
+            @Override
+            public void onError(Throwable t) {
+                future.completeExceptionally(t);
+            }
+
+            @Override
+            public void onCompleted() {
+                if (!future.isDone()) {
+                    future.completeExceptionally(Status.INTERNAL
+                            .withDescription("manager StreamIndexDocuments closed without a response")
+                            .asRuntimeException());
+                }
+            }
+        };
+
+        StreamObserver<StreamIndexDocumentsRequest> reqObs = managerStub.streamIndexDocuments(respObs);
+        try {
+            reqObs.onNext(request);
+            reqObs.onCompleted();
+        } catch (RuntimeException e) {
+            // If the half-close throws, surface a clean status so callers see
+            // the underlying transport problem rather than a half-future.
+            future.completeExceptionally(e);
+        }
+
+        try {
+            return future.get(INDEX_RPC_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        } catch (ExecutionException e) {
+            Throwable cause = e.getCause() != null ? e.getCause() : e;
+            if (cause instanceof StatusRuntimeException sre) {
+                throw sre;
+            }
+            if (cause instanceof RuntimeException re) {
+                throw re;
+            }
+            throw new RuntimeException(cause);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw Status.CANCELLED.withCause(e)
+                    .withDescription("interrupted awaiting StreamIndexDocuments response")
+                    .asRuntimeException();
+        } catch (TimeoutException e) {
+            throw Status.DEADLINE_EXCEEDED.withCause(e)
+                    .withDescription("timed out after " + INDEX_RPC_TIMEOUT_SECONDS
+                            + "s awaiting StreamIndexDocuments response")
+                    .asRuntimeException();
+        }
     }
 }

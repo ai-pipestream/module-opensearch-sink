@@ -1,37 +1,18 @@
 package ai.pipestream.module.opensearchsink;
 
-import ai.pipestream.ingestion.v1.MutinyOpenSearchIngestionServiceGrpc;
+import ai.pipestream.ingestion.v1.OpenSearchIngestionServiceGrpc;
 import ai.pipestream.ingestion.v1.StreamDocumentsRequest;
 import ai.pipestream.ingestion.v1.StreamDocumentsResponse;
-import ai.pipestream.data.module.v1.PipeStepProcessorService;
-import ai.pipestream.data.module.v1.ProcessDataRequest;
-import ai.pipestream.data.module.v1.ProcessDataResponse;
-import ai.pipestream.data.module.v1.ProcessingOutcome;
-import ai.pipestream.data.module.v1.GetServiceRegistrationRequest;
-import ai.pipestream.data.module.v1.GetServiceRegistrationResponse;
-import ai.pipestream.data.v1.LogEntry;
-import ai.pipestream.data.v1.LogEntrySource;
-import ai.pipestream.data.v1.LogLevel;
-import ai.pipestream.data.v1.ModuleLogOrigin;
-import ai.pipestream.module.opensearchsink.config.OpenSearchSinkOptions;
-import ai.pipestream.module.opensearchsink.plan.IndexPlanCache;
-import ai.pipestream.module.opensearchsink.plan.PlanResolutionException;
-import ai.pipestream.module.opensearchsink.plan.ResolvedPlan;
-import ai.pipestream.module.opensearchsink.schema.SchemaExtractorService;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.google.protobuf.util.JsonFormat;
-import ai.pipestream.server.meta.BuildInfoProvider;
+import ai.pipestream.module.opensearchsink.service.DocumentConverterService;
+import io.grpc.stub.StreamObserver;
 import io.quarkus.grpc.GrpcService;
-import io.quarkus.runtime.annotations.RegisterForReflection;
-import io.smallrye.mutiny.Multi;
-import io.smallrye.mutiny.Uni;
 import io.quarkus.runtime.StartupEvent;
+import io.quarkus.runtime.annotations.RegisterForReflection;
+import io.smallrye.common.annotation.RunOnVirtualThread;
 import jakarta.enterprise.event.Observes;
 import jakarta.inject.Inject;
 import jakarta.inject.Singleton;
 import org.jboss.logging.Logger;
-
-import ai.pipestream.module.opensearchsink.service.ConversionResult;
 
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -39,70 +20,140 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * gRPC service implementation for the OpenSearch sink.
- * Handles both the ingestion stream and standard pipeline step processing.
+ * gRPC service implementation for the OpenSearch sink's experimental direct
+ * ingestion stream. Distinct from {@link OpenSearchPipeStepProcessorImpl},
+ * which handles the production module-step entrypoint used by the engine.
  *
- * <p>{@link #processData(ProcessDataRequest)} is the production module-step entrypoint
- * used by the engine. {@link #streamDocuments(Multi)} is an experimental direct-ingestion
- * path for load testing and future transport work; it is not currently wired into normal
- * DAG execution.
+ * <p>{@code streamDocuments} is a bidi stream of documents direct from a
+ * loader into the sink. The sink batches them into micro-batches of 100,
+ * provisions every distinct (index, semantic-config-set) once per batch,
+ * then opens one bidi stream to the manager per micro-batch via
+ * {@link SchemaManagerService#streamIndexDocumentsViaManager(List)} to push
+ * the documents downstream.
  */
 @Singleton
 @GrpcService
 @RegisterForReflection
-public class OpenSearchIngestionServiceImpl extends MutinyOpenSearchIngestionServiceGrpc.OpenSearchIngestionServiceImplBase implements PipeStepProcessorService {
+public class OpenSearchIngestionServiceImpl
+        extends OpenSearchIngestionServiceGrpc.OpenSearchIngestionServiceImplBase {
 
     private static final Logger LOG = Logger.getLogger(OpenSearchIngestionServiceImpl.class);
+    private static final int BATCH_SIZE = 100;
 
     @Inject
     SchemaManagerService schemaManager;
 
     @Inject
-    ai.pipestream.module.opensearchsink.service.DocumentConverterService documentConverter;
-
-    @Inject
-    SchemaExtractorService schemaExtractorService;
-
-    @Inject
-    ObjectMapper objectMapper;
-
-    @Inject
-    BuildInfoProvider buildInfoProvider;
-
-    @Inject
-    IndexPlanCache indexPlanCache;
+    DocumentConverterService documentConverter;
 
     void onStart(@Observes StartupEvent ev) {
         LOG.info("OpenSearch Ingestion Service starting...");
     }
 
+    /**
+     * Plain async-callback bidi handler. The inbound observer accumulates
+     * requests into a 100-element micro-batch buffer and flushes each full
+     * batch (and the trailing partial batch on close) on a virtual thread:
+     * provisioning + manager bidi stream are blocking calls.
+     */
     @Override
-    public Multi<StreamDocumentsResponse> streamDocuments(Multi<StreamDocumentsRequest> requestStream) {
+    @RunOnVirtualThread
+    public StreamObserver<StreamDocumentsRequest> streamDocuments(
+            StreamObserver<StreamDocumentsResponse> responseObserver) {
         LOG.info("Experimental StreamDocuments called for OpenSearch sink module");
 
-        return requestStream.group().intoLists().of(100)
-                .onItem().transformToMultiAndConcatenate(batch -> {
-                    if (batch == null || batch.isEmpty()) return Multi.createFrom().empty();
+        return new StreamObserver<>() {
+            private final List<StreamDocumentsRequest> buffer = new ArrayList<>();
 
-                    return provisionBatch(batch)
-                            .onItem().transformToMulti(v -> schemaManager.streamIndexDocumentsViaManager(
-                                    Multi.createFrom().iterable(batch)
-                                            .onItem().transform(this::toManagerRequest)))
-                            .onFailure().recoverWithMulti(t -> failedBatchResponses(batch, t));
-                })
-                .onItem().transform(resp -> {
-                    String message = resp.getSuccess() ? resp.getMessage() : "Indexing failed: " + resp.getMessage();
-                    return StreamDocumentsResponse.newBuilder()
-                        .setRequestId(resp.getRequestId())
-                        .setDocumentId(resp.getDocumentId())
-                        .setSuccess(resp.getSuccess())
-                        .setMessage(message)
-                        .build();
-                })
-                .onFailure().invoke(t -> LOG.error("Stream to manager failed", t));
+            @Override
+            public synchronized void onNext(StreamDocumentsRequest request) {
+                buffer.add(request);
+                if (buffer.size() >= BATCH_SIZE) {
+                    List<StreamDocumentsRequest> batch = new ArrayList<>(buffer);
+                    buffer.clear();
+                    flush(batch, responseObserver);
+                }
+            }
+
+            @Override
+            public synchronized void onError(Throwable t) {
+                LOG.error("Inbound StreamDocuments stream errored", t);
+                responseObserver.onError(t);
+            }
+
+            @Override
+            public synchronized void onCompleted() {
+                if (!buffer.isEmpty()) {
+                    List<StreamDocumentsRequest> batch = new ArrayList<>(buffer);
+                    buffer.clear();
+                    flush(batch, responseObserver);
+                }
+                responseObserver.onCompleted();
+            }
+        };
     }
 
-    private Uni<Void> provisionBatch(List<StreamDocumentsRequest> batch) {
+    /**
+     * Provision every distinct (index, semantic-config-set) in the batch,
+     * stream the batch to the manager, and forward correlated responses to
+     * the caller. Plain blocking on a virtual thread.
+     */
+    void flush(List<StreamDocumentsRequest> batch, StreamObserver<StreamDocumentsResponse> responseObserver) {
+        if (batch.isEmpty()) return;
+        try {
+            provisionBatch(batch);
+        } catch (RuntimeException provisioningFailure) {
+            String message = provisioningFailure.getMessage() != null
+                    ? provisioningFailure.getMessage()
+                    : provisioningFailure.toString();
+            for (StreamDocumentsRequest req : batch) {
+                responseObserver.onNext(StreamDocumentsResponse.newBuilder()
+                        .setRequestId(req.getRequestId())
+                        .setDocumentId(req.getDocument().getDocId())
+                        .setSuccess(false)
+                        .setMessage("Indexing failed: " + message)
+                        .build());
+            }
+            return;
+        }
+
+        List<ai.pipestream.opensearch.v1.StreamIndexDocumentsRequest> managerRequests =
+                new ArrayList<>(batch.size());
+        for (StreamDocumentsRequest req : batch) {
+            managerRequests.add(toManagerRequest(req));
+        }
+
+        List<ai.pipestream.opensearch.v1.StreamIndexDocumentsResponse> managerResponses;
+        try {
+            managerResponses = schemaManager.streamIndexDocumentsViaManager(managerRequests);
+        } catch (RuntimeException streamFailure) {
+            LOG.error("Stream to manager failed", streamFailure);
+            String message = streamFailure.getMessage() != null
+                    ? streamFailure.getMessage()
+                    : streamFailure.toString();
+            for (StreamDocumentsRequest req : batch) {
+                responseObserver.onNext(StreamDocumentsResponse.newBuilder()
+                        .setRequestId(req.getRequestId())
+                        .setDocumentId(req.getDocument().getDocId())
+                        .setSuccess(false)
+                        .setMessage("Indexing failed: " + message)
+                        .build());
+            }
+            return;
+        }
+
+        for (ai.pipestream.opensearch.v1.StreamIndexDocumentsResponse resp : managerResponses) {
+            String forward = resp.getSuccess() ? resp.getMessage() : "Indexing failed: " + resp.getMessage();
+            responseObserver.onNext(StreamDocumentsResponse.newBuilder()
+                    .setRequestId(resp.getRequestId())
+                    .setDocumentId(resp.getDocumentId())
+                    .setSuccess(resp.getSuccess())
+                    .setMessage(forward)
+                    .build());
+        }
+    }
+
+    private void provisionBatch(List<StreamDocumentsRequest> batch) {
         Map<String, ProvisioningTarget> targets = new LinkedHashMap<>();
         for (StreamDocumentsRequest req : batch) {
             String documentType = documentType(req);
@@ -112,20 +163,17 @@ public class OpenSearchIngestionServiceImpl extends MutinyOpenSearchIngestionSer
                 targets.putIfAbsent(cacheKey, new ProvisioningTarget(indexName, req.getDocument(), documentType));
             }
         }
-        if (targets.isEmpty()) {
-            return Uni.createFrom().voidItem();
+        for (ProvisioningTarget target : targets.values()) {
+            schemaManager.ensureIndexProvisioned(
+                    target.indexName(), target.document(), target.documentType());
         }
-        List<Uni<Void>> provisioningCalls = targets.values().stream()
-                .map(target -> schemaManager.ensureIndexProvisioned(
-                        target.indexName(), target.document(), target.documentType()))
-                .toList();
-        return Uni.combine().all().unis(provisioningCalls).discardItems().replaceWithVoid();
     }
 
     private ai.pipestream.opensearch.v1.StreamIndexDocumentsRequest toManagerRequest(StreamDocumentsRequest req) {
         String docType = documentType(req);
         String indexName = schemaManager.determineIndexName(docType);
-        ai.pipestream.opensearch.v1.OpenSearchDocument osDoc = documentConverter.convertToOpenSearchDocument(req.getDocument());
+        ai.pipestream.opensearch.v1.OpenSearchDocument osDoc =
+                documentConverter.convertToOpenSearchDocument(req.getDocument());
 
         LOG.debugf("Streaming document %s to manager index %s", req.getDocument().getDocId(), indexName);
 
@@ -142,18 +190,6 @@ public class OpenSearchIngestionServiceImpl extends MutinyOpenSearchIngestionSer
         return builder.build();
     }
 
-    private Multi<ai.pipestream.opensearch.v1.StreamIndexDocumentsResponse> failedBatchResponses(
-            List<StreamDocumentsRequest> batch, Throwable failure) {
-        String message = failure.getMessage() != null ? failure.getMessage() : failure.toString();
-        return Multi.createFrom().iterable(batch)
-                .onItem().transform(req -> ai.pipestream.opensearch.v1.StreamIndexDocumentsResponse.newBuilder()
-                        .setRequestId(req.getRequestId())
-                        .setDocumentId(req.getDocument().getDocId())
-                        .setSuccess(false)
-                        .setMessage(message)
-                        .build());
-    }
-
     private static String documentType(StreamDocumentsRequest req) {
         return req.getDocument().hasSearchMetadata()
                 ? req.getDocument().getSearchMetadata().getDocumentType()
@@ -161,175 +197,4 @@ public class OpenSearchIngestionServiceImpl extends MutinyOpenSearchIngestionSer
     }
 
     private record ProvisioningTarget(String indexName, ai.pipestream.data.v1.PipeDoc document, String documentType) {}
-
-    @Override
-    public Uni<ProcessDataResponse> processData(ProcessDataRequest request) {
-        long startTime = System.currentTimeMillis();
-        List<LogEntry> auditLogs = new ArrayList<>();
-        LOG.info("ProcessData called for OpenSearch sink module");
-
-        if (!request.hasDocument()) {
-            return Uni.createFrom().item(ProcessDataResponse.newBuilder()
-                .setOutcome(ProcessingOutcome.PROCESSING_OUTCOME_FAILURE)
-                .addLogEntries(moduleLog("No document provided in request", LogLevel.LOG_LEVEL_ERROR))
-                .build());
-        }
-
-        String docId = request.getDocument().getDocId();
-
-        // 1. Extract and parse JSON configuration provided by the Engine.
-        // The sink REQUIRES a config carrying plan_ids — there is no
-        // "infer index name from document type" fallback now that plans
-        // are the single source of routing truth.
-        OpenSearchSinkOptions options;
-        if (!request.hasConfig() || !request.getConfig().hasJsonConfig()) {
-            return Uni.createFrom().item(ProcessDataResponse.newBuilder()
-                    .setOutcome(ProcessingOutcome.PROCESSING_OUTCOME_FAILURE)
-                    .addLogEntries(moduleLog(
-                            "OpenSearch sink requires JSON config carrying plan_ids; none was provided on the request",
-                            LogLevel.LOG_LEVEL_ERROR))
-                    .build());
-        }
-        try {
-            String json = JsonFormat.printer().print(request.getConfig().getJsonConfig());
-            options = objectMapper.readValue(json, OpenSearchSinkOptions.class);
-        } catch (Exception e) {
-            LOG.error("Failed to parse Sink configuration from request", e);
-            return Uni.createFrom().item(ProcessDataResponse.newBuilder()
-                    .setOutcome(ProcessingOutcome.PROCESSING_OUTCOME_FAILURE)
-                    .addLogEntries(moduleLog("Invalid configuration: " + e.getMessage(), LogLevel.LOG_LEVEL_ERROR))
-                    .build());
-        }
-
-        // 2. Resolve plan_ids → ResolvedPlan snapshots. This is the sink's
-        // "startup verification" path, run per request: every plan must
-        // exist and be READY or the request fails loud with a message
-        // naming each offender.
-        final OpenSearchSinkOptions parsedOptions = options;
-        return indexPlanCache.resolve(parsedOptions.planIdsOrEmpty())
-                .onFailure(PlanResolutionException.class).transform(t -> t)
-                .flatMap(plans -> indexAcrossPlans(request, parsedOptions, plans, startTime, auditLogs, docId))
-                .onFailure(PlanResolutionException.class).recoverWithItem(error -> {
-                    LOG.errorf(error, "Plan resolution failed for docId=%s", docId);
-                    auditLogs.add(moduleLog(
-                            "Plan resolution failed: " + error.getMessage(),
-                            LogLevel.LOG_LEVEL_ERROR));
-                    return ProcessDataResponse.newBuilder()
-                            .setOutcome(ProcessingOutcome.PROCESSING_OUTCOME_FAILURE)
-                            .addAllLogEntries(auditLogs)
-                            .setOutputDoc(request.getDocument())
-                            .build();
-                });
-    }
-
-    /**
-     * Index the document into every {@link ResolvedPlan} returned from the
-     * cache. Each plan governs one physical index (or, for SEPARATE_INDICES,
-     * one prefix); the sink fan-outs sequentially per plan and aggregates
-     * results. Any failure on any plan fails the whole request — partial
-     * success is not modelled because a doc indexed into N-1 plans and not
-     * the Nth would be silently inconsistent across queries that hit the
-     * missing plan.
-     */
-    private Uni<ProcessDataResponse> indexAcrossPlans(
-            ProcessDataRequest request,
-            OpenSearchSinkOptions options,
-            List<ResolvedPlan> plans,
-            long startTime,
-            List<LogEntry> auditLogs,
-            String docId) {
-
-        // Convert document once — reused for both audit trail and indexing
-        ConversionResult conversionResult = documentConverter.convertWithAuditLog(request.getDocument());
-        conversionResult.auditLogs().forEach(msg -> auditLogs.add(moduleLog(msg, LogLevel.LOG_LEVEL_INFO)));
-
-        String crawlId = request.hasMetadata() ? request.getMetadata().getCrawlId() : "";
-
-        // Sequential fan-out: one Uni per plan, chained via flatMap, so a
-        // failure short-circuits the rest. Sequential (not concat) keeps
-        // gRPC fan-out predictable and avoids piling pressure on the
-        // manager when a sink fans out across many plans.
-        Uni<Void> chain = Uni.createFrom().voidItem();
-        for (ResolvedPlan plan : plans) {
-            chain = chain.flatMap(v -> indexIntoPlan(request, options, plan, conversionResult, crawlId, auditLogs, docId));
-        }
-
-        return chain
-                .map(v -> {
-                    long duration = System.currentTimeMillis() - startTime;
-                    LOG.infof("OpenSearch sink indexed docId=%s across %d plan(s) in %dms",
-                            docId, plans.size(), duration);
-                    auditLogs.add(moduleLog(
-                            "Document indexed successfully across " + plans.size()
-                                    + " plan(s) in " + duration + "ms",
-                            LogLevel.LOG_LEVEL_INFO));
-                    return ProcessDataResponse.newBuilder()
-                            .setOutcome(ProcessingOutcome.PROCESSING_OUTCOME_SUCCESS)
-                            .addAllLogEntries(auditLogs)
-                            .setOutputDoc(request.getDocument())
-                            .build();
-                })
-                .onFailure().recoverWithItem(error -> {
-                    long duration = System.currentTimeMillis() - startTime;
-                    LOG.errorf(error, "Failed to index document %s across plans", docId);
-                    auditLogs.add(moduleLog(
-                            "Document indexing failed after " + duration + "ms: " + error.getMessage(),
-                            LogLevel.LOG_LEVEL_ERROR));
-                    return ProcessDataResponse.newBuilder()
-                            .setOutcome(ProcessingOutcome.PROCESSING_OUTCOME_FAILURE)
-                            .addAllLogEntries(auditLogs)
-                            .setOutputDoc(request.getDocument())
-                            .build();
-                });
-    }
-
-    private Uni<Void> indexIntoPlan(
-            ProcessDataRequest request,
-            OpenSearchSinkOptions options,
-            ResolvedPlan plan,
-            ConversionResult conversionResult,
-            String crawlId,
-            List<LogEntry> auditLogs,
-            String docId) {
-
-        auditLogs.add(moduleLog(
-                "Indexing document " + docId + " via plan " + plan.id()
-                        + " into '" + plan.indexName()
-                        + "' with strategy " + plan.strategy().name(),
-                LogLevel.LOG_LEVEL_INFO));
-
-        return schemaManager
-                .indexDocumentViaManager(plan, request.getDocument(), conversionResult.document(), options, crawlId)
-                .replaceWithVoid();
-    }
-
-    private static LogEntry moduleLog(String message, LogLevel level) {
-        return LogEntry.newBuilder()
-            .setSource(LogEntrySource.LOG_ENTRY_SOURCE_MODULE)
-            .setLevel(level)
-            .setMessage(message)
-            .setTimestampEpochMs(System.currentTimeMillis())
-            .setModule(ModuleLogOrigin.newBuilder().setModuleName("opensearch-sink").build())
-            .build();
-    }
-
-    @Override
-    public Uni<GetServiceRegistrationResponse> getServiceRegistration(GetServiceRegistrationRequest request) {
-        LOG.info("GetServiceRegistration called for OpenSearch sink module");
-
-        GetServiceRegistrationResponse.Builder responseBuilder = GetServiceRegistrationResponse.newBuilder()
-                .setModuleName("opensearch-sink")
-                .setVersion(buildInfoProvider.getVersion())
-                .setDisplayName("OpenSearch Sink")
-                .setDescription("OpenSearch vector indexing sink with organic schema management. Standard pipeline execution uses processData; StreamDocuments is experimental.")
-                .putAllMetadata(buildInfoProvider.registrationMetadata())
-                .setHealthCheckPassed(true)
-                .setHealthCheckMessage("OpenSearch sink module is healthy");
-
-        schemaExtractorService.extractConfigSchemaResolvedForJsonForms()
-                .ifPresent(responseBuilder::setJsonConfigSchema);
-
-        return Uni.createFrom().item(responseBuilder.build());
-    }
-
 }

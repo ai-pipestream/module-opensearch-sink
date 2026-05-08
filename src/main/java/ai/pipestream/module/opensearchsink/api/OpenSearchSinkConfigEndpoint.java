@@ -2,7 +2,6 @@ package ai.pipestream.module.opensearchsink.api;
 
 import ai.pipestream.module.opensearchsink.config.OpenSearchSinkOptions;
 import ai.pipestream.module.opensearchsink.schema.SchemaExtractorService;
-import io.smallrye.mutiny.Uni;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.*;
 import jakarta.ws.rs.core.MediaType;
@@ -44,16 +43,14 @@ public class OpenSearchSinkConfigEndpoint {
             schema = @Schema(implementation = OpenSearchSinkOptions.class)
         )
     )
-    public Uni<Response> getConfigJsonForms() {
-        return Uni.createFrom().item(() -> {
-            Optional<String> schema = schemaExtractorService.extractConfigSchemaResolvedForJsonForms();
-            if (schema.isPresent()) {
-                return Response.ok(schema.get()).type(MediaType.APPLICATION_JSON).build();
-            }
-            LOG.warn("Could not extract OpenSearchSinkOptions schema from OpenAPI document");
-            return Response.status(Response.Status.SERVICE_UNAVAILABLE)
+    public Response getConfigJsonForms() {
+        Optional<String> schema = schemaExtractorService.extractConfigSchemaResolvedForJsonForms();
+        if (schema.isPresent()) {
+            return Response.ok(schema.get()).type(MediaType.APPLICATION_JSON).build();
+        }
+        LOG.warn("Could not extract OpenSearchSinkOptions schema from OpenAPI document");
+        return Response.status(Response.Status.SERVICE_UNAVAILABLE)
                 .entity(Map.of("error", "Schema not available"))
                 .build();
-        });
     }
 }

@@ -10,8 +10,7 @@ import ai.pipestream.ingestion.v1.StreamDocumentsResponse;
 import ai.pipestream.module.opensearchsink.service.DocumentConverterService;
 import ai.pipestream.opensearch.v1.StreamIndexDocumentsRequest;
 import ai.pipestream.opensearch.v1.StreamIndexDocumentsResponse;
-import io.smallrye.mutiny.Multi;
-import io.smallrye.mutiny.Uni;
+import io.grpc.stub.StreamObserver;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
@@ -36,14 +35,23 @@ class OpenSearchIngestionStreamBatchingTest {
         service.documentConverter = new DocumentConverterService();
     }
 
+    private List<StreamDocumentsResponse> drive(List<StreamDocumentsRequest> requests) {
+        CapturingResponseObserver responseObs = new CapturingResponseObserver();
+        StreamObserver<StreamDocumentsRequest> reqObs = service.streamDocuments(responseObs);
+        for (StreamDocumentsRequest req : requests) {
+            reqObs.onNext(req);
+        }
+        reqObs.onCompleted();
+        return responseObs.responses;
+    }
+
     @Test
     void streamDocuments_opensOneManagerStreamPerMicroBatch() {
         List<StreamDocumentsRequest> requests = IntStream.range(0, 250)
                 .mapToObj(i -> request("req-" + i, doc("doc-" + i, "article", "sem-article")))
                 .toList();
 
-        List<StreamDocumentsResponse> responses = service.streamDocuments(Multi.createFrom().iterable(requests))
-                .collect().asList().await().indefinitely();
+        List<StreamDocumentsResponse> responses = drive(requests);
 
         assertThat(responses)
                 .as("every input document should receive one correlated response")
@@ -62,8 +70,7 @@ class OpenSearchIngestionStreamBatchingTest {
                 request("req-article-2", doc("doc-article-2", "article", "sem-article"))
         );
 
-        List<StreamDocumentsResponse> responses = service.streamDocuments(Multi.createFrom().iterable(requests))
-                .collect().asList().await().indefinitely();
+        List<StreamDocumentsResponse> responses = drive(requests);
 
         assertThat(responses)
                 .as("heterogeneous batches should still index every document")
@@ -85,8 +92,7 @@ class OpenSearchIngestionStreamBatchingTest {
                 request("req-pdf-2", doc("doc-pdf-2", "pdf", "sem-pdf"))
         );
 
-        List<StreamDocumentsResponse> responses = service.streamDocuments(Multi.createFrom().iterable(requests))
-                .collect().asList().await().indefinitely();
+        List<StreamDocumentsResponse> responses = drive(requests);
 
         assertThat(responses)
                 .as("provisioning failure should surface per document")
@@ -133,6 +139,13 @@ class OpenSearchIngestionStreamBatchingTest {
                 .build();
     }
 
+    private static final class CapturingResponseObserver implements StreamObserver<StreamDocumentsResponse> {
+        final List<StreamDocumentsResponse> responses = new ArrayList<>();
+        @Override public void onNext(StreamDocumentsResponse value) { responses.add(value); }
+        @Override public void onError(Throwable t) { throw new AssertionError("unexpected onError", t); }
+        @Override public void onCompleted() { /* no-op */ }
+    }
+
     private static final class RecordingSchemaManager extends SchemaManagerService {
         final List<List<StreamIndexDocumentsRequest>> streamedBatches = new ArrayList<>();
         final Set<String> provisionedKeys = new LinkedHashSet<>();
@@ -156,29 +169,28 @@ class OpenSearchIngestionStreamBatchingTest {
         }
 
         @Override
-        public Uni<Void> ensureIndexProvisioned(String indexName, PipeDoc document, String documentType) {
+        public void ensureIndexProvisioned(String indexName, PipeDoc document, String documentType) {
             String key = provisioningCacheKey(indexName, document);
             provisionedKeys.add(key);
             if (failedKeys.contains(key)) {
-                return Uni.createFrom().failure(new RuntimeException("provisioning failed for " + key));
+                throw new RuntimeException("provisioning failed for " + key);
             }
-            return Uni.createFrom().voidItem();
         }
 
         @Override
-        public Multi<StreamIndexDocumentsResponse> streamIndexDocumentsViaManager(
-                Multi<StreamIndexDocumentsRequest> requests) {
-            return requests.collect().asList()
-                    .onItem().transformToMulti(batch -> {
-                        streamedBatches.add(batch);
-                        return Multi.createFrom().iterable(batch)
-                                .onItem().transform(req -> StreamIndexDocumentsResponse.newBuilder()
-                                        .setRequestId(req.getRequestId())
-                                        .setDocumentId(req.getDocumentId())
-                                        .setSuccess(true)
-                                        .setMessage("ok")
-                                        .build());
-                    });
+        public List<StreamIndexDocumentsResponse> streamIndexDocumentsViaManager(
+                List<StreamIndexDocumentsRequest> requests) {
+            streamedBatches.add(new ArrayList<>(requests));
+            List<StreamIndexDocumentsResponse> out = new ArrayList<>(requests.size());
+            for (StreamIndexDocumentsRequest req : requests) {
+                out.add(StreamIndexDocumentsResponse.newBuilder()
+                        .setRequestId(req.getRequestId())
+                        .setDocumentId(req.getDocumentId())
+                        .setSuccess(true)
+                        .setMessage("ok")
+                        .build());
+            }
+            return out;
         }
     }
 }

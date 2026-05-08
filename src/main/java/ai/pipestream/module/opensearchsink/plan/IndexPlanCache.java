@@ -1,21 +1,18 @@
 package ai.pipestream.module.opensearchsink.plan;
 
-import ai.pipestream.module.opensearchsink.grpc.GrpcFutures;
 import ai.pipestream.opensearch.v1.GetIndexPlanRequest;
 import ai.pipestream.opensearch.v1.GetIndexPlanResponse;
 import ai.pipestream.opensearch.v1.IndexPlan;
 import ai.pipestream.opensearch.v1.IndexPlanServiceGrpc;
 import ai.pipestream.opensearch.v1.IndexPlanStatus;
-import ai.pipestream.quarkus.dynamicgrpc.DynamicGrpcClientFactory;
 import com.github.benmanes.caffeine.cache.Cache;
 import com.github.benmanes.caffeine.cache.Caffeine;
 import io.grpc.Status;
 import io.grpc.StatusRuntimeException;
-import io.smallrye.mutiny.Uni;
+import io.quarkus.grpc.GrpcClient;
 import jakarta.annotation.PostConstruct;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
-import org.eclipse.microprofile.config.inject.ConfigProperty;
 import org.jboss.logging.Logger;
 
 import java.util.ArrayList;
@@ -26,7 +23,7 @@ import java.util.concurrent.TimeUnit;
 
 /**
  * Resolves {@code plan_ids[]} from the sink config to {@link ResolvedPlan}
- * snapshots fetched from {@code IndexPlanService} via Consul-discovered gRPC.
+ * snapshots fetched from {@code IndexPlanService} via Stork-discovered gRPC.
  * <p>
  * Behavior:
  * <ul>
@@ -49,11 +46,8 @@ public class IndexPlanCache {
     private static final Logger LOG = Logger.getLogger(IndexPlanCache.class);
 
     @Inject
-    DynamicGrpcClientFactory grpcClientFactory;
-
-    @ConfigProperty(name = "module.opensearch-sink.index-plan-service",
-                    defaultValue = "opensearch-manager")
-    String indexPlanServiceName;
+    @GrpcClient("opensearch-manager")
+    IndexPlanServiceGrpc.IndexPlanServiceBlockingStub indexPlanBlockingStub;
 
     private Cache<String, ResolvedPlan> cache;
 
@@ -113,24 +107,17 @@ public class IndexPlanCache {
     }
 
     private FetchOutcome grpcFetcher(String planId) {
-        IndexPlanServiceGrpc.IndexPlanServiceStub stub =
-                grpcClientFactory.getBlockingClient(indexPlanServiceName,
-                        IndexPlanServiceGrpc::newStub);
         GetIndexPlanRequest req = GetIndexPlanRequest.newBuilder().setId(planId).build();
         GetIndexPlanResponse resp;
         try {
-            resp = GrpcFutures.<GetIndexPlanResponse>unary(observer ->
-                    stub.getIndexPlan(req, observer)).get();
-        } catch (java.util.concurrent.ExecutionException e) {
-            Throwable cause = e.getCause() != null ? e.getCause() : e;
-            if (cause instanceof StatusRuntimeException sre
-                    && sre.getStatus().getCode() == Status.Code.NOT_FOUND) {
+            resp = indexPlanBlockingStub.getIndexPlan(req);
+        } catch (StatusRuntimeException sre) {
+            if (sre.getStatus().getCode() == Status.Code.NOT_FOUND) {
                 return FetchOutcome.missing();
             }
-            return FetchOutcome.error(cause.getMessage() == null ? cause.toString() : cause.getMessage());
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            return FetchOutcome.error("interrupted");
+            return FetchOutcome.error(sre.getMessage() == null ? sre.toString() : sre.getMessage());
+        } catch (RuntimeException e) {
+            return FetchOutcome.error(e.getMessage() == null ? e.toString() : e.getMessage());
         }
         if (!resp.hasPlan()) {
             return FetchOutcome.missing();
@@ -144,83 +131,81 @@ public class IndexPlanCache {
      * with a message naming every offending id if any cannot be resolved or
      * is not READY. Empty / null list also throws.
      * <p>
-     * Returns a {@link Uni} so the call composes with the rest of the sink's
-     * Mutiny pipeline; the actual blocking gRPC happens on a virtual thread.
+     * Plain blocking method; callers run on a virtual thread so the gRPC
+     * round-trip parks cheaply.
      */
-    public Uni<List<ResolvedPlan>> resolve(List<String> planIds) {
+    public List<ResolvedPlan> resolve(List<String> planIds) {
         if (planIds == null || planIds.isEmpty()) {
-            return Uni.createFrom().failure(new PlanResolutionException(
-                    "OpenSearchSinkOptions.plan_ids is empty; the sink requires at least one IndexPlan reference"));
+            throw new PlanResolutionException(
+                    "OpenSearchSinkOptions.plan_ids is empty; the sink requires at least one IndexPlan reference");
         }
 
-        return Uni.createFrom().item(() -> {
-            Map<String, ResolvedPlan> hits = new LinkedHashMap<>();
-            List<String> toFetch = new ArrayList<>();
-            for (String id : planIds) {
-                if (id == null || id.isBlank()) {
-                    throw new PlanResolutionException(
-                            "OpenSearchSinkOptions.plan_ids contains a null or blank entry; "
-                                    + "every plan id must be a non-empty string");
+        Map<String, ResolvedPlan> hits = new LinkedHashMap<>();
+        List<String> toFetch = new ArrayList<>();
+        for (String id : planIds) {
+            if (id == null || id.isBlank()) {
+                throw new PlanResolutionException(
+                        "OpenSearchSinkOptions.plan_ids contains a null or blank entry; "
+                                + "every plan id must be a non-empty string");
+            }
+            ResolvedPlan cached = cache.getIfPresent(id);
+            if (cached != null) {
+                hits.put(id, cached);
+            } else {
+                toFetch.add(id);
+            }
+        }
+
+        if (!toFetch.isEmpty()) {
+            List<String> missing = new ArrayList<>();
+            List<String> notReady = new ArrayList<>();
+            List<String> errors = new ArrayList<>();
+
+            for (String id : toFetch) {
+                FetchOutcome outcome = fetcher.fetch(id);
+                if (outcome instanceof FetchOutcome.Missing) {
+                    missing.add(id);
+                    continue;
                 }
-                ResolvedPlan cached = cache.getIfPresent(id);
-                if (cached != null) {
-                    hits.put(id, cached);
-                } else {
-                    toFetch.add(id);
+                if (outcome instanceof FetchOutcome.Error err) {
+                    errors.add(id + " (" + err.message() + ")");
+                    continue;
                 }
+                IndexPlan plan = ((FetchOutcome.Found) outcome).plan();
+                if (plan.getStatus() != IndexPlanStatus.INDEX_PLAN_STATUS_READY) {
+                    notReady.add(id + " (status=" + plan.getStatus().name()
+                            + (plan.getLastError().isEmpty() ? "" : ", lastError=\"" + plan.getLastError() + "\"")
+                            + ")");
+                    continue;
+                }
+                ResolvedPlan resolved = ResolvedPlan.from(plan);
+                cache.put(id, resolved);
+                hits.put(id, resolved);
             }
 
-            if (!toFetch.isEmpty()) {
-                List<String> missing = new ArrayList<>();
-                List<String> notReady = new ArrayList<>();
-                List<String> errors = new ArrayList<>();
-
-                for (String id : toFetch) {
-                    FetchOutcome outcome = fetcher.fetch(id);
-                    if (outcome instanceof FetchOutcome.Missing) {
-                        missing.add(id);
-                        continue;
-                    }
-                    if (outcome instanceof FetchOutcome.Error err) {
-                        errors.add(id + " (" + err.message() + ")");
-                        continue;
-                    }
-                    IndexPlan plan = ((FetchOutcome.Found) outcome).plan();
-                    if (plan.getStatus() != IndexPlanStatus.INDEX_PLAN_STATUS_READY) {
-                        notReady.add(id + " (status=" + plan.getStatus().name()
-                                + (plan.getLastError().isEmpty() ? "" : ", lastError=\"" + plan.getLastError() + "\"")
-                                + ")");
-                        continue;
-                    }
-                    ResolvedPlan resolved = ResolvedPlan.from(plan);
-                    cache.put(id, resolved);
-                    hits.put(id, resolved);
+            if (!missing.isEmpty() || !notReady.isEmpty() || !errors.isEmpty()) {
+                StringBuilder sb = new StringBuilder("IndexPlan resolution failed:");
+                if (!missing.isEmpty()) {
+                    sb.append(" missing=").append(missing);
                 }
-
-                if (!missing.isEmpty() || !notReady.isEmpty() || !errors.isEmpty()) {
-                    StringBuilder sb = new StringBuilder("IndexPlan resolution failed:");
-                    if (!missing.isEmpty()) {
-                        sb.append(" missing=").append(missing);
-                    }
-                    if (!notReady.isEmpty()) {
-                        sb.append(" not_ready=").append(notReady);
-                    }
-                    if (!errors.isEmpty()) {
-                        sb.append(" errors=").append(errors);
-                    }
-                    throw new PlanResolutionException(sb.toString());
+                if (!notReady.isEmpty()) {
+                    sb.append(" not_ready=").append(notReady);
                 }
+                if (!errors.isEmpty()) {
+                    sb.append(" errors=").append(errors);
+                }
+                throw new PlanResolutionException(sb.toString());
             }
+        }
 
-            // Preserve input order
-            List<ResolvedPlan> ordered = new ArrayList<>(planIds.size());
-            for (String id : planIds) {
-                ordered.add(hits.get(id));
-            }
-            LOG.debugf("Resolved %d IndexPlans (cache hits=%d, fetched=%d)",
-                    ordered.size(), planIds.size() - toFetch.size(), toFetch.size());
-            return ordered;
-        });
+        // Preserve input order
+        List<ResolvedPlan> ordered = new ArrayList<>(planIds.size());
+        for (String id : planIds) {
+            ordered.add(hits.get(id));
+        }
+        LOG.debugf("Resolved %d IndexPlans (cache hits=%d, fetched=%d)",
+                ordered.size(), planIds.size() - toFetch.size(), toFetch.size());
+        return ordered;
     }
 
     /**
