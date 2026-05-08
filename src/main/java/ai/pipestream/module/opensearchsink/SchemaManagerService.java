@@ -233,19 +233,26 @@ public class SchemaManagerService {
      * Maps the local {@link IndexingStrategy} enum to the proto's
      * {@link ai.pipestream.opensearch.v1.IndexingStrategy} enum.
      * <p>
-     * {@code null} maps to {@code INDEXING_STRATEGY_UNSPECIFIED} so the
-     * manager applies its server-side default (currently CHUNK_COMBINED).
-     * Local NESTED maps to the explicit {@code INDEXING_STRATEGY_NESTED}
-     * value rather than UNSPECIFIED, so a user who picked NESTED keeps
-     * NESTED even when the system default changes.
+     * {@code null} maps to {@code INDEXING_STRATEGY_CHUNK_COMBINED} — the
+     * sink's null-default must MATCH what opensearch-manager picks for
+     * UNSPECIFIED (also CHUNK_COMBINED). If they disagree the sink takes
+     * the nested branch below (no chunk_documents on the request) while
+     * the manager interprets the request as CHUNK_COMBINED and rejects
+     * with "CHUNK_COMBINED strategy requires document_map". Pinning the
+     * null case here keeps both sides aligned and the wire value
+     * explicit.
      * <p>
-     * PARENT_CHILD is deprecated and unused. We map it to UNSPECIFIED so
-     * any stale config silently falls back to the server-side default
+     * Local NESTED maps to the explicit {@code INDEXING_STRATEGY_NESTED}
+     * so a user who picked NESTED keeps NESTED even when the system
+     * default changes.
+     * <p>
+     * PARENT_CHILD is deprecated and unused. We map it to UNSPECIFIED
+     * so stale configs silently fall back to the manager's default
      * instead of throwing.
      */
     static ai.pipestream.opensearch.v1.IndexingStrategy mapToProtoStrategy(IndexingStrategy local) {
         if (local == null) {
-            return ai.pipestream.opensearch.v1.IndexingStrategy.INDEXING_STRATEGY_UNSPECIFIED;
+            return ai.pipestream.opensearch.v1.IndexingStrategy.INDEXING_STRATEGY_CHUNK_COMBINED;
         }
         return switch (local) {
             case NESTED -> ai.pipestream.opensearch.v1.IndexingStrategy.INDEXING_STRATEGY_NESTED;
