@@ -5,15 +5,22 @@ import ai.pipestream.data.v1.*;
 import ai.pipestream.ingestion.v1.StreamDocumentsRequest;
 import ai.pipestream.ingestion.v1.StreamDocumentsResponse;
 import ai.pipestream.ingestion.v1.MutinyOpenSearchIngestionServiceGrpc;
+import ai.pipestream.module.opensearchsink.plan.IndexPlanCache;
+import ai.pipestream.opensearch.v1.IndexPlan;
+import ai.pipestream.opensearch.v1.IndexPlanStatus;
+import ai.pipestream.opensearch.v1.IndexingStrategy;
 import ai.pipestream.test.support.OpenSearchSinkWireMockTestResource;
 import io.quarkus.grpc.GrpcClient;
 import io.quarkus.test.common.QuarkusTestResource;
 import io.quarkus.test.junit.QuarkusTest;
 import io.smallrye.mutiny.Multi;
 import jakarta.inject.Inject;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -30,6 +37,29 @@ public class OpenSearchSinkServiceTest {
 
     @Inject
     SchemaManagerService schemaManager;
+
+    @Inject
+    IndexPlanCache planCache;
+
+    private Map<String, IndexPlanCache.FetchOutcome> plans;
+
+    @BeforeEach
+    void seedPlans() {
+        plans = new HashMap<>();
+        plans.put("plan-manual-override", IndexPlanCache.FetchOutcome.found(
+                IndexPlan.newBuilder()
+                        .setId("plan-manual-override")
+                        .setName("plan-manual-override")
+                        .setIndexName("manual-override-index")
+                        .setIndexingStrategy(IndexingStrategy.INDEXING_STRATEGY_NESTED)
+                        .setStatus(IndexPlanStatus.INDEX_PLAN_STATUS_READY)
+                        .build()));
+        planCache.setFetcher(id -> {
+            IndexPlanCache.FetchOutcome o = plans.get(id);
+            return o == null ? IndexPlanCache.FetchOutcome.missing() : o;
+        });
+        planCache.invalidateAll();
+    }
 
     @Test
     void testStreamDocuments_Success_ContractValidation() {
@@ -98,11 +128,16 @@ public class OpenSearchSinkServiceTest {
         long now = System.currentTimeMillis() / 1000;
         PipeDoc testDoc = createTestDoc("doc-custom-cfg", "any-type", now);
 
-        // Build the Struct that JSONForms would produce
+        // Build the Struct that JSONForms would produce. The sink config now
+        // references an IndexPlan id; the test seeds the IndexPlanCache with
+        // a READY plan whose index_name matches the manual-override-index
+        // string the WireMock manager mock expects.
+        com.google.protobuf.ListValue planIds = com.google.protobuf.ListValue.newBuilder()
+                .addValues(com.google.protobuf.Value.newBuilder().setStringValue("plan-manual-override").build())
+                .build();
         com.google.protobuf.Struct jsonConfig = com.google.protobuf.Struct.newBuilder()
                 .putFields("opensearch_instance", com.google.protobuf.Value.newBuilder().setStringValue("prod-cluster").build())
-                .putFields("index_name", com.google.protobuf.Value.newBuilder().setStringValue("manual-override-index").build())
-                .putFields("indexing_strategy", com.google.protobuf.Value.newBuilder().setStringValue("NESTED").build())
+                .putFields("plan_ids", com.google.protobuf.Value.newBuilder().setListValue(planIds).build())
                 .build();
 
         ai.pipestream.data.module.v1.ProcessDataRequest request = ai.pipestream.data.module.v1.ProcessDataRequest.newBuilder()

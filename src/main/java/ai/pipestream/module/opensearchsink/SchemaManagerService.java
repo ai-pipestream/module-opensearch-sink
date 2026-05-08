@@ -2,9 +2,9 @@ package ai.pipestream.module.opensearchsink;
 
 import ai.pipestream.data.v1.PipeDoc;
 import ai.pipestream.opensearch.v1.*;
-import ai.pipestream.module.opensearchsink.config.IndexingStrategy;
 import ai.pipestream.module.opensearchsink.config.OpenSearchSinkOptions;
 import ai.pipestream.module.opensearchsink.grpc.GrpcFutures;
+import ai.pipestream.module.opensearchsink.plan.ResolvedPlan;
 import ai.pipestream.module.opensearchsink.service.ChunkConversionResult;
 import ai.pipestream.module.opensearchsink.service.ChunkDocumentConverter;
 import ai.pipestream.quarkus.dynamicgrpc.DynamicGrpcClientFactory;
@@ -18,10 +18,8 @@ import jakarta.inject.Inject;
 import org.eclipse.microprofile.config.inject.ConfigProperty;
 import org.jboss.logging.Logger;
 
-import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
-import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
@@ -137,10 +135,14 @@ public class SchemaManagerService {
     }
 
     /**
-     * Proxies the indexing request to the OpenSearch Manager.
+     * Proxies the indexing request to the OpenSearch Manager, scoped to a
+     * single {@link ResolvedPlan}. The plan dictates the physical index name
+     * and the indexing strategy used to fan documents out into chunk / vector
+     * indices; the sink no longer carries either field on its config.
      */
-    public Uni<String> indexDocumentViaManager(String indexName, PipeDoc document, OpenSearchDocument osDoc, Optional<OpenSearchSinkOptions> options) {
-        return indexDocumentViaManager(indexName, document, osDoc, options, "");
+    public Uni<String> indexDocumentViaManager(ResolvedPlan plan, PipeDoc document, OpenSearchDocument osDoc,
+                                                OpenSearchSinkOptions options) {
+        return indexDocumentViaManager(plan, document, osDoc, options, "");
     }
 
     /**
@@ -149,9 +151,17 @@ public class SchemaManagerService {
      * downstream per-run progress queries (GetCrawlIndexStats) can filter
      * by it. Empty crawlId is treated as "no stamp" — the field is left
      * unset and the docs index without a crawl_id (legacy behavior).
+     * <p>
+     * The {@code plan} carries the index name and indexing strategy. Routing
+     * lives entirely in the plan; the sink's only contribution is the doc
+     * payload + crawl_id stamping. {@code options} is currently unused
+     * inside this method (BatchOptions belong to the streaming path) and is
+     * carried only for forward-compatibility with future per-call knobs.
      */
-    public Uni<String> indexDocumentViaManager(String indexName, PipeDoc document, OpenSearchDocument osDoc,
-                                                Optional<OpenSearchSinkOptions> options, String crawlId) {
+    @SuppressWarnings("unused")
+    public Uni<String> indexDocumentViaManager(ResolvedPlan plan, PipeDoc document, OpenSearchDocument osDoc,
+                                                OpenSearchSinkOptions options, String crawlId) {
+        String indexName = plan.indexName();
         String docType = document.hasSearchMetadata() ? document.getSearchMetadata().getDocumentType() : null;
         // Stamp crawl_id on the base document up-front. The conversion path
         // (DocumentConverterService) sees only PipeDoc and can't know about
@@ -171,8 +181,16 @@ public class SchemaManagerService {
                         requestBuilder.setDatasourceId(document.getOwnership().getDatasourceId());
                     }
 
-                    IndexingStrategy localStrategy = options.map(OpenSearchSinkOptions::indexingStrategy).orElse(null);
-                    ai.pipestream.opensearch.v1.IndexingStrategy protoStrategy = mapToProtoStrategy(localStrategy);
+                    ai.pipestream.opensearch.v1.IndexingStrategy protoStrategy = plan.strategy();
+                    if (protoStrategy == null
+                            || protoStrategy == ai.pipestream.opensearch.v1.IndexingStrategy.INDEXING_STRATEGY_UNSPECIFIED) {
+                        // A READY plan must carry a concrete strategy. Coercing UNSPECIFIED
+                        // here would silently misroute documents to the wrong index shape;
+                        // refuse loud so the operator sees the misconfigured plan id.
+                        throw new IllegalStateException(
+                                "IndexPlan '" + plan.id() + "' returned UNSPECIFIED indexing_strategy on a READY plan — "
+                                        + "manager contract violation; plan is misconfigured");
+                    }
                     requestBuilder.setIndexingStrategy(protoStrategy);
 
                     if (protoStrategy == ai.pipestream.opensearch.v1.IndexingStrategy.INDEXING_STRATEGY_CHUNK_COMBINED
@@ -192,8 +210,8 @@ public class SchemaManagerService {
                             requestBuilder.addAllChunkDocuments(chunkResult.chunkDocuments());
                         }
 
-                        LOG.infof("Enriched IndexDocumentRequest with %d chunk documents for strategy %s (doc %s)",
-                                chunkResult.chunkDocuments().size(), protoStrategy, document.getDocId());
+                        LOG.infof("Enriched IndexDocumentRequest with %d chunk documents for strategy %s (doc %s, plan %s)",
+                                chunkResult.chunkDocuments().size(), protoStrategy, document.getDocId(), plan.id());
                     }
 
                     // Plain async stub + GrpcFutures + virtual thread.
@@ -227,39 +245,6 @@ public class SchemaManagerService {
                             })
                             .runSubscriptionOn(BLOCKING_GRPC_EXECUTOR);
                 });
-    }
-
-    /**
-     * Maps the local {@link IndexingStrategy} enum to the proto's
-     * {@link ai.pipestream.opensearch.v1.IndexingStrategy} enum.
-     * <p>
-     * {@code null} maps to {@code INDEXING_STRATEGY_CHUNK_COMBINED} — the
-     * sink's null-default must MATCH what opensearch-manager picks for
-     * UNSPECIFIED (also CHUNK_COMBINED). If they disagree the sink takes
-     * the nested branch below (no chunk_documents on the request) while
-     * the manager interprets the request as CHUNK_COMBINED and rejects
-     * with "CHUNK_COMBINED strategy requires document_map". Pinning the
-     * null case here keeps both sides aligned and the wire value
-     * explicit.
-     * <p>
-     * Local NESTED maps to the explicit {@code INDEXING_STRATEGY_NESTED}
-     * so a user who picked NESTED keeps NESTED even when the system
-     * default changes.
-     * <p>
-     * PARENT_CHILD is deprecated and unused. We map it to UNSPECIFIED
-     * so stale configs silently fall back to the manager's default
-     * instead of throwing.
-     */
-    static ai.pipestream.opensearch.v1.IndexingStrategy mapToProtoStrategy(IndexingStrategy local) {
-        if (local == null) {
-            return ai.pipestream.opensearch.v1.IndexingStrategy.INDEXING_STRATEGY_CHUNK_COMBINED;
-        }
-        return switch (local) {
-            case NESTED -> ai.pipestream.opensearch.v1.IndexingStrategy.INDEXING_STRATEGY_NESTED;
-            case PARENT_CHILD -> ai.pipestream.opensearch.v1.IndexingStrategy.INDEXING_STRATEGY_UNSPECIFIED;
-            case CHUNK_COMBINED -> ai.pipestream.opensearch.v1.IndexingStrategy.INDEXING_STRATEGY_CHUNK_COMBINED;
-            case SEPARATE_INDICES -> ai.pipestream.opensearch.v1.IndexingStrategy.INDEXING_STRATEGY_SEPARATE_INDICES;
-        };
     }
 
     /**

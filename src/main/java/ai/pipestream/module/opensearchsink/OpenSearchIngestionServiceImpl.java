@@ -14,6 +14,9 @@ import ai.pipestream.data.v1.LogEntrySource;
 import ai.pipestream.data.v1.LogLevel;
 import ai.pipestream.data.v1.ModuleLogOrigin;
 import ai.pipestream.module.opensearchsink.config.OpenSearchSinkOptions;
+import ai.pipestream.module.opensearchsink.plan.IndexPlanCache;
+import ai.pipestream.module.opensearchsink.plan.PlanResolutionException;
+import ai.pipestream.module.opensearchsink.plan.ResolvedPlan;
 import ai.pipestream.module.opensearchsink.schema.SchemaExtractorService;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.protobuf.util.JsonFormat;
@@ -34,7 +37,6 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Optional;
 
 /**
  * gRPC service implementation for the OpenSearch sink.
@@ -66,6 +68,9 @@ public class OpenSearchIngestionServiceImpl extends MutinyOpenSearchIngestionSer
 
     @Inject
     BuildInfoProvider buildInfoProvider;
+
+    @Inject
+    IndexPlanCache indexPlanCache;
 
     void onStart(@Observes StartupEvent ev) {
         LOG.info("OpenSearch Ingestion Service starting...");
@@ -172,60 +177,130 @@ public class OpenSearchIngestionServiceImpl extends MutinyOpenSearchIngestionSer
 
         String docId = request.getDocument().getDocId();
 
-        // 1. Extract and parse JSON configuration provided by the Engine
-        Optional<OpenSearchSinkOptions> options = Optional.empty();
-        if (request.hasConfig() && request.getConfig().hasJsonConfig()) {
-            try {
-                String json = JsonFormat.printer().print(request.getConfig().getJsonConfig());
-                options = Optional.of(objectMapper.readValue(json, OpenSearchSinkOptions.class));
-            } catch (Exception e) {
-                LOG.error("Failed to parse Sink configuration from request", e);
-                return Uni.createFrom().item(ProcessDataResponse.newBuilder()
-                        .setOutcome(ProcessingOutcome.PROCESSING_OUTCOME_FAILURE)
-                        .addLogEntries(moduleLog("Invalid configuration: " + e.getMessage(), LogLevel.LOG_LEVEL_ERROR))
-                        .build());
-            }
+        // 1. Extract and parse JSON configuration provided by the Engine.
+        // The sink REQUIRES a config carrying plan_ids — there is no
+        // "infer index name from document type" fallback now that plans
+        // are the single source of routing truth.
+        OpenSearchSinkOptions options;
+        if (!request.hasConfig() || !request.getConfig().hasJsonConfig()) {
+            return Uni.createFrom().item(ProcessDataResponse.newBuilder()
+                    .setOutcome(ProcessingOutcome.PROCESSING_OUTCOME_FAILURE)
+                    .addLogEntries(moduleLog(
+                            "OpenSearch sink requires JSON config carrying plan_ids; none was provided on the request",
+                            LogLevel.LOG_LEVEL_ERROR))
+                    .build());
+        }
+        try {
+            String json = JsonFormat.printer().print(request.getConfig().getJsonConfig());
+            options = objectMapper.readValue(json, OpenSearchSinkOptions.class);
+        } catch (Exception e) {
+            LOG.error("Failed to parse Sink configuration from request", e);
+            return Uni.createFrom().item(ProcessDataResponse.newBuilder()
+                    .setOutcome(ProcessingOutcome.PROCESSING_OUTCOME_FAILURE)
+                    .addLogEntries(moduleLog("Invalid configuration: " + e.getMessage(), LogLevel.LOG_LEVEL_ERROR))
+                    .build());
         }
 
-        // 2. Convert document once — reused for both audit trail and indexing
+        // 2. Resolve plan_ids → ResolvedPlan snapshots. This is the sink's
+        // "startup verification" path, run per request: every plan must
+        // exist and be READY or the request fails loud with a message
+        // naming each offender.
+        final OpenSearchSinkOptions parsedOptions = options;
+        return indexPlanCache.resolve(parsedOptions.planIdsOrEmpty())
+                .onFailure(PlanResolutionException.class).transform(t -> t)
+                .flatMap(plans -> indexAcrossPlans(request, parsedOptions, plans, startTime, auditLogs, docId))
+                .onFailure(PlanResolutionException.class).recoverWithItem(error -> {
+                    LOG.errorf(error, "Plan resolution failed for docId=%s", docId);
+                    auditLogs.add(moduleLog(
+                            "Plan resolution failed: " + error.getMessage(),
+                            LogLevel.LOG_LEVEL_ERROR));
+                    return ProcessDataResponse.newBuilder()
+                            .setOutcome(ProcessingOutcome.PROCESSING_OUTCOME_FAILURE)
+                            .addAllLogEntries(auditLogs)
+                            .setOutputDoc(request.getDocument())
+                            .build();
+                });
+    }
+
+    /**
+     * Index the document into every {@link ResolvedPlan} returned from the
+     * cache. Each plan governs one physical index (or, for SEPARATE_INDICES,
+     * one prefix); the sink fan-outs sequentially per plan and aggregates
+     * results. Any failure on any plan fails the whole request — partial
+     * success is not modelled because a doc indexed into N-1 plans and not
+     * the Nth would be silently inconsistent across queries that hit the
+     * missing plan.
+     */
+    private Uni<ProcessDataResponse> indexAcrossPlans(
+            ProcessDataRequest request,
+            OpenSearchSinkOptions options,
+            List<ResolvedPlan> plans,
+            long startTime,
+            List<LogEntry> auditLogs,
+            String docId) {
+
+        // Convert document once — reused for both audit trail and indexing
         ConversionResult conversionResult = documentConverter.convertWithAuditLog(request.getDocument());
         conversionResult.auditLogs().forEach(msg -> auditLogs.add(moduleLog(msg, LogLevel.LOG_LEVEL_INFO)));
 
-        // 3. Determine index name and log strategy
-        String indexName = options.map(OpenSearchSinkOptions::indexName)
-                .orElseGet(() -> schemaManager.determineIndexName(
-                        request.getDocument().hasSearchMetadata() ? request.getDocument().getSearchMetadata().getDocumentType() : null));
-        String strategyName = options.map(o -> o.indexingStrategy() != null ? o.indexingStrategy().name() : "NESTED")
-                .orElse("NESTED");
-        auditLogs.add(moduleLog("Indexing document " + docId + " to collection '" + indexName
-                + "' with strategy " + strategyName, LogLevel.LOG_LEVEL_INFO));
-
-        // 4. Index via manager — schemaManager.indexDocumentViaManager handles eager provisioning internally.
-        // Pass crawl_id through so the sink stamps it on the base + chunk indexed payloads,
-        // enabling per-run progress queries via GetCrawlIndexStats. Engine populates
-        // ServiceMetadata.crawl_id from PipeStream.metadata.crawl_id on every dispatch.
         String crawlId = request.hasMetadata() ? request.getMetadata().getCrawlId() : "";
-        return schemaManager.indexDocumentViaManager(indexName, request.getDocument(), conversionResult.document(), options, crawlId)
-            .map(managerMessage -> {
-                long duration = System.currentTimeMillis() - startTime;
-                LOG.infof("OpenSearch sink indexed docId=%s index=%s in %dms", docId, indexName, duration);
-                auditLogs.add(moduleLog("Document indexed successfully in " + duration + "ms", LogLevel.LOG_LEVEL_INFO));
-                return ProcessDataResponse.newBuilder()
-                    .setOutcome(ProcessingOutcome.PROCESSING_OUTCOME_SUCCESS)
-                    .addAllLogEntries(auditLogs)
-                    .setOutputDoc(request.getDocument())
-                    .build();
-            })
-            .onFailure().recoverWithItem(error -> {
-                long duration = System.currentTimeMillis() - startTime;
-                LOG.errorf(error, "Failed to index document %s via manager", docId);
-                auditLogs.add(moduleLog("Document indexing failed after " + duration + "ms: " + error.getMessage(), LogLevel.LOG_LEVEL_ERROR));
-                return ProcessDataResponse.newBuilder()
-                    .setOutcome(ProcessingOutcome.PROCESSING_OUTCOME_FAILURE)
-                    .addAllLogEntries(auditLogs)
-                    .setOutputDoc(request.getDocument())
-                    .build();
-            });
+
+        // Sequential fan-out: one Uni per plan, chained via flatMap, so a
+        // failure short-circuits the rest. Sequential (not concat) keeps
+        // gRPC fan-out predictable and avoids piling pressure on the
+        // manager when a sink fans out across many plans.
+        Uni<Void> chain = Uni.createFrom().voidItem();
+        for (ResolvedPlan plan : plans) {
+            chain = chain.flatMap(v -> indexIntoPlan(request, options, plan, conversionResult, crawlId, auditLogs, docId));
+        }
+
+        return chain
+                .map(v -> {
+                    long duration = System.currentTimeMillis() - startTime;
+                    LOG.infof("OpenSearch sink indexed docId=%s across %d plan(s) in %dms",
+                            docId, plans.size(), duration);
+                    auditLogs.add(moduleLog(
+                            "Document indexed successfully across " + plans.size()
+                                    + " plan(s) in " + duration + "ms",
+                            LogLevel.LOG_LEVEL_INFO));
+                    return ProcessDataResponse.newBuilder()
+                            .setOutcome(ProcessingOutcome.PROCESSING_OUTCOME_SUCCESS)
+                            .addAllLogEntries(auditLogs)
+                            .setOutputDoc(request.getDocument())
+                            .build();
+                })
+                .onFailure().recoverWithItem(error -> {
+                    long duration = System.currentTimeMillis() - startTime;
+                    LOG.errorf(error, "Failed to index document %s across plans", docId);
+                    auditLogs.add(moduleLog(
+                            "Document indexing failed after " + duration + "ms: " + error.getMessage(),
+                            LogLevel.LOG_LEVEL_ERROR));
+                    return ProcessDataResponse.newBuilder()
+                            .setOutcome(ProcessingOutcome.PROCESSING_OUTCOME_FAILURE)
+                            .addAllLogEntries(auditLogs)
+                            .setOutputDoc(request.getDocument())
+                            .build();
+                });
+    }
+
+    private Uni<Void> indexIntoPlan(
+            ProcessDataRequest request,
+            OpenSearchSinkOptions options,
+            ResolvedPlan plan,
+            ConversionResult conversionResult,
+            String crawlId,
+            List<LogEntry> auditLogs,
+            String docId) {
+
+        auditLogs.add(moduleLog(
+                "Indexing document " + docId + " via plan " + plan.id()
+                        + " into '" + plan.indexName()
+                        + "' with strategy " + plan.strategy().name(),
+                LogLevel.LOG_LEVEL_INFO));
+
+        return schemaManager
+                .indexDocumentViaManager(plan, request.getDocument(), conversionResult.document(), options, crawlId)
+                .replaceWithVoid();
     }
 
     private static LogEntry moduleLog(String message, LogLevel level) {
