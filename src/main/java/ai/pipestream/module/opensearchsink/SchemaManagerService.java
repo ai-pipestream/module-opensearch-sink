@@ -232,13 +232,23 @@ public class SchemaManagerService {
     /**
      * Maps the local {@link IndexingStrategy} enum to the proto's
      * {@link ai.pipestream.opensearch.v1.IndexingStrategy} enum.
+     * <p>
+     * {@code null} maps to {@code INDEXING_STRATEGY_UNSPECIFIED} so the
+     * manager applies its server-side default (currently CHUNK_COMBINED).
+     * Local NESTED maps to the explicit {@code INDEXING_STRATEGY_NESTED}
+     * value rather than UNSPECIFIED, so a user who picked NESTED keeps
+     * NESTED even when the system default changes.
+     * <p>
+     * PARENT_CHILD is deprecated and unused. We map it to UNSPECIFIED so
+     * any stale config silently falls back to the server-side default
+     * instead of throwing.
      */
     static ai.pipestream.opensearch.v1.IndexingStrategy mapToProtoStrategy(IndexingStrategy local) {
         if (local == null) {
             return ai.pipestream.opensearch.v1.IndexingStrategy.INDEXING_STRATEGY_UNSPECIFIED;
         }
         return switch (local) {
-            case NESTED -> ai.pipestream.opensearch.v1.IndexingStrategy.INDEXING_STRATEGY_UNSPECIFIED;
+            case NESTED -> ai.pipestream.opensearch.v1.IndexingStrategy.INDEXING_STRATEGY_NESTED;
             case PARENT_CHILD -> ai.pipestream.opensearch.v1.IndexingStrategy.INDEXING_STRATEGY_UNSPECIFIED;
             case CHUNK_COMBINED -> ai.pipestream.opensearch.v1.IndexingStrategy.INDEXING_STRATEGY_CHUNK_COMBINED;
             case SEPARATE_INDICES -> ai.pipestream.opensearch.v1.IndexingStrategy.INDEXING_STRATEGY_SEPARATE_INDICES;

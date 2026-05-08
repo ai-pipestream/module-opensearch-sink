@@ -4,13 +4,18 @@ import org.eclipse.microprofile.openapi.annotations.media.Schema;
 
 /**
  * Determines how documents and their embeddings are physically organized within the target index.
+ * <p>
+ * When this option is left unset on a sink config, the request goes to
+ * opensearch-manager as {@code INDEXING_STRATEGY_UNSPECIFIED} and the manager
+ * applies its server-side default — currently CHUNK_COMBINED. Pick a value
+ * here only when you want to override that default for this sink.
  */
 @Schema(name = "IndexingStrategy",
         description = "Determines how documents and their embeddings are physically organized within the target index.")
 public enum IndexingStrategy {
     /**
      * All semantic chunks are stored as nested objects within the parent document.
-     * This is the default and works well for typical chunk counts.
+     * Simple and efficient for typical chunk counts.
      */
     @Schema(description = "Semantic chunks are stored as nested objects within the parent document. " +
                           "Simple and efficient for typical chunk counts.")
