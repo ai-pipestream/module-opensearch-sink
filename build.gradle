@@ -62,6 +62,10 @@ dependencies {
     // OpenSearch Java client types (mapping types for schema, etc.)
     implementation libs.opensearch.java
 
+    // Redis: sink XADDs IndexRequest protobuf to pipestream:indexing:<plan_id>;
+    // opensearch-manager consumes these streams (Phase 2). Producer-only here.
+    implementation 'io.quarkus:quarkus-redis-client'
+
     // Pipestream platform libraries
     implementation 'ai.pipestream:pipestream-quarkus-devservices'
     implementation 'ai.pipestream:quarkus-dynamic-grpc'

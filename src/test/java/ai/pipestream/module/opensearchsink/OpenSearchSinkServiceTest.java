@@ -11,12 +11,14 @@ import ai.pipestream.opensearch.v1.IndexPlanStatus;
 import ai.pipestream.opensearch.v1.IndexingStrategy;
 import ai.pipestream.test.support.OpenSearchSinkWireMockTestResource;
 import io.quarkus.grpc.GrpcClient;
+import io.quarkus.test.InjectMock;
 import io.quarkus.test.common.QuarkusTestResource;
 import io.quarkus.test.junit.QuarkusTest;
 import io.smallrye.mutiny.Multi;
 import jakarta.inject.Inject;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.mockito.Mockito;
 
 import java.util.HashMap;
 import java.util.List;
@@ -37,6 +39,9 @@ public class OpenSearchSinkServiceTest {
 
     @Inject
     SchemaManagerService schemaManager;
+
+    @InjectMock
+    OpenSearchIndexingPublisher indexingPublisher;
 
     @Inject
     IndexPlanCache planCache;
@@ -59,6 +64,15 @@ public class OpenSearchSinkServiceTest {
             return o == null ? IndexPlanCache.FetchOutcome.missing() : o;
         });
         planCache.invalidateAll();
+
+        // processData's new behavior is "publish to redis per plan." The mock
+        // returns a stub stream-entry id so the call succeeds without redis
+        // needing to be reachable; assertions about the XADD itself live in
+        // OpenSearchIndexingPublisherTest where the redis interaction is
+        // verified directly.
+        Mockito.when(indexingPublisher.publish(
+                Mockito.any(), Mockito.any(), Mockito.any(), Mockito.anyString()))
+                .thenReturn("0-0");
     }
 
     @Test
@@ -150,7 +164,13 @@ public class OpenSearchSinkServiceTest {
         ai.pipestream.data.module.v1.ProcessDataResponse response = processorClient.processData(request).await().indefinitely();
 
         assertEquals(ai.pipestream.data.module.v1.ProcessingOutcome.PROCESSING_OUTCOME_SUCCESS, response.getOutcome());
-        assertTrue(response.getLogEntriesList().stream().map(LogEntry::getMessage).anyMatch(log -> log.contains("WireMock") || log.contains("indexed")));
+        // Sink's contract is now "request queued for indexing." Actual
+        // OpenSearch durability is reported asynchronously by the manager-side
+        // consumer in Phase 2; the audit trail at this layer reflects the
+        // queue handoff.
+        assertTrue(response.getLogEntriesList().stream()
+                .map(LogEntry::getMessage)
+                .anyMatch(log -> log.contains("queued")));
     }
 
     private PipeDoc createTestDoc(String docId, String docType, long timestamp) {

@@ -52,7 +52,7 @@ public class OpenSearchPipeStepProcessorImpl
     private static final Logger LOG = Logger.getLogger(OpenSearchPipeStepProcessorImpl.class);
 
     @Inject
-    SchemaManagerService schemaManager;
+    OpenSearchIndexingPublisher indexingPublisher;
 
     @Inject
     DocumentConverterService documentConverter;
@@ -142,26 +142,32 @@ public class OpenSearchPipeStepProcessorImpl
 
         String crawlId = request.hasMetadata() ? request.getMetadata().getCrawlId() : "";
 
-        // 4. Sequential fan-out: one indexing call per plan. A failure on
-        // any plan fails the whole request — partial success is not
-        // modelled because a doc indexed into N-1 plans and not the Nth
-        // would be silently inconsistent across queries that hit the
-        // missing plan.
+        // 4. Sequential fan-out: one XADD per plan to that plan's redis
+        // indexing stream (pipestream:indexing:<plan_id>). The sink's role
+        // is now produce-only — opensearch-manager consumes these streams
+        // and performs the actual OpenSearch bulk write asynchronously. A
+        // failure on any plan's XADD fails the whole request because a
+        // doc enqueued for N-1 plans and dropped on the Nth would create
+        // silent across-index inconsistency once the manager drains.
+        //
+        // HANDOFF success at this node means "request shaped and queued";
+        // end-to-end OpenSearch durability comes back via the receipt
+        // event the manager will emit on bulk-ACK (Phase 2).
         try {
             for (ResolvedPlan plan : plans) {
                 auditLogs.add(moduleLog(
-                        "Indexing document " + docId + " via plan " + plan.id()
-                                + " into '" + plan.indexName()
+                        "Queueing document " + docId + " via plan " + plan.id()
+                                + " for index '" + plan.indexName()
                                 + "' with strategy " + plan.strategy().name(),
                         LogLevel.LOG_LEVEL_INFO));
-                schemaManager.indexDocumentViaManager(
-                        plan, request.getDocument(), conversionResult.document(), options, crawlId);
+                indexingPublisher.publish(
+                        plan, request.getDocument(), conversionResult.document(), crawlId);
             }
         } catch (RuntimeException error) {
             long duration = System.currentTimeMillis() - startTime;
-            LOG.errorf(error, "Failed to index document %s across plans", docId);
+            LOG.errorf(error, "Failed to queue document %s across plans", docId);
             auditLogs.add(moduleLog(
-                    "Document indexing failed after " + duration + "ms: " + error.getMessage(),
+                    "Document queue-for-indexing failed after " + duration + "ms: " + error.getMessage(),
                     LogLevel.LOG_LEVEL_ERROR));
             responseObserver.onNext(ProcessDataResponse.newBuilder()
                     .setOutcome(ProcessingOutcome.PROCESSING_OUTCOME_FAILURE)
@@ -173,10 +179,10 @@ public class OpenSearchPipeStepProcessorImpl
         }
 
         long duration = System.currentTimeMillis() - startTime;
-        LOG.infof("OpenSearch sink indexed docId=%s across %d plan(s) in %dms",
+        LOG.infof("OpenSearch sink queued docId=%s across %d plan(s) in %dms",
                 docId, plans.size(), duration);
         auditLogs.add(moduleLog(
-                "Document indexed successfully across " + plans.size()
+                "Document queued for indexing across " + plans.size()
                         + " plan(s) in " + duration + "ms",
                 LogLevel.LOG_LEVEL_INFO));
         responseObserver.onNext(ProcessDataResponse.newBuilder()
