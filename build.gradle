@@ -30,7 +30,7 @@ pipestreamProtos {
     sourceMode = 'git-proto-workspace'
     gitRepo = "https://github.com/ai-pipestream/pipestream-protos.git"
     gitRef = "bom/engine-refactor-pr0"
-    generateMutiny = true
+    generateMutiny = false
     generateDescriptors = true
 
     modules {

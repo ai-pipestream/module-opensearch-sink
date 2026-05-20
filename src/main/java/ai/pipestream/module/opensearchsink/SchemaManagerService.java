@@ -25,9 +25,11 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.stream.Collectors;
@@ -371,82 +373,81 @@ public class SchemaManagerService {
         if (requests == null || requests.isEmpty()) {
             return List.of();
         }
-
-        StreamObserver<StreamIndexDocumentsRequest> obs = ensureStream();
-        if (obs == null) {
-            throw Status.UNAVAILABLE
-                    .withDescription("manager StreamIndexDocuments not open")
-                    .asRuntimeException();
-        }
-
-        // Register every future BEFORE sending so the response dispatcher
-        // can never miss a match due to ordering.
-        List<CompletableFuture<StreamIndexDocumentsResponse>> futures = new ArrayList<>(requests.size());
-        List<String> requestIds = new ArrayList<>(requests.size());
-        for (StreamIndexDocumentsRequest req : requests) {
-            String requestId = req.getRequestId();
-            CompletableFuture<StreamIndexDocumentsResponse> f = new CompletableFuture<>();
-            // If a caller reused a request_id we'd silently drop the prior
-            // future — refuse loud so the bug is visible.
-            if (pending.putIfAbsent(requestId, f) != null) {
-                // unwind every future already registered for this batch
-                for (String already : requestIds) pending.remove(already);
-                throw new IllegalStateException(
-                        "duplicate request_id in pending map: " + requestId);
+        // Experimental ingestion opens one stream per micro-batch so the
+        // manager (and WireMock in tests) can half-close after each batch.
+        // The persistent stream in {@link #streamOne} is for steady per-doc
+        // indexing on the production path.
+        BlockingQueue<Object> responses = new LinkedBlockingQueue<>();
+        Object completeMarker = new Object();
+        StreamObserver<StreamIndexDocumentsResponse> respObs = new StreamObserver<>() {
+            @Override
+            public void onNext(StreamIndexDocumentsResponse v) {
+                responses.add(v);
             }
-            futures.add(f);
-            requestIds.add(requestId);
-        }
 
+            @Override
+            public void onError(Throwable t) {
+                responses.add(t);
+            }
+
+            @Override
+            public void onCompleted() {
+                responses.add(completeMarker);
+            }
+        };
+        StreamObserver<StreamIndexDocumentsRequest> batchReqObs =
+                managerStub.streamIndexDocuments(respObs);
         try {
-            synchronized (writeLock) {
-                for (StreamIndexDocumentsRequest req : requests) {
-                    obs.onNext(req);
-                }
+            for (StreamIndexDocumentsRequest req : requests) {
+                batchReqObs.onNext(req);
             }
+            batchReqObs.onCompleted();
         } catch (RuntimeException sendError) {
-            for (String id : requestIds) pending.remove(id);
-            handleStreamFailure(sendError);
+            try {
+                batchReqObs.onError(sendError);
+            } catch (RuntimeException ignored) {
+                // already failed; surface the original
+            }
             throw sendError;
         }
 
-        // Drain in request order — each future independently bounded by the
-        // per-call deadline; the deadline applies to the WHOLE batch in
-        // wall-clock terms so a slow doc can't extend the deadline for the
-        // ones behind it.
-        List<StreamIndexDocumentsResponse> responses = new ArrayList<>(requests.size());
+        List<StreamIndexDocumentsResponse> collected = new ArrayList<>(requests.size());
         long deadlineNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(INDEX_RPC_TIMEOUT_SECONDS);
-        for (int i = 0; i < futures.size(); i++) {
-            CompletableFuture<StreamIndexDocumentsResponse> f = futures.get(i);
-            String requestId = requestIds.get(i);
+        while (true) {
             long remaining = deadlineNanos - System.nanoTime();
+            if (remaining <= 0) {
+                throw Status.DEADLINE_EXCEEDED
+                        .withDescription("timed out after " + INDEX_RPC_TIMEOUT_SECONDS
+                                + "s draining StreamIndexDocuments responses (got "
+                                + collected.size() + " of " + requests.size() + ")")
+                        .asRuntimeException();
+            }
+            Object next;
             try {
-                if (remaining <= 0) {
-                    throw new TimeoutException();
-                }
-                responses.add(f.get(remaining, TimeUnit.NANOSECONDS));
-            } catch (ExecutionException e) {
-                pending.remove(requestId);
-                Throwable cause = e.getCause() != null ? e.getCause() : e;
-                if (cause instanceof StatusRuntimeException sre) throw sre;
-                if (cause instanceof RuntimeException re) throw re;
-                throw new RuntimeException(cause);
+                next = responses.poll(remaining, TimeUnit.NANOSECONDS);
             } catch (InterruptedException e) {
-                pending.remove(requestId);
                 Thread.currentThread().interrupt();
                 throw Status.CANCELLED.withCause(e)
                         .withDescription("interrupted draining StreamIndexDocuments responses")
                         .asRuntimeException();
-            } catch (TimeoutException e) {
-                pending.remove(requestId);
-                throw Status.DEADLINE_EXCEEDED.withCause(e)
-                        .withDescription("timed out after " + INDEX_RPC_TIMEOUT_SECONDS
-                                + "s draining StreamIndexDocuments responses (got "
-                                + responses.size() + " of " + requests.size() + ")")
-                        .asRuntimeException();
             }
+            if (next == null) {
+                continue;
+            }
+            if (next == completeMarker) {
+                return collected;
+            }
+            if (next instanceof Throwable t) {
+                if (t instanceof StatusRuntimeException sre) {
+                    throw sre;
+                }
+                if (t instanceof RuntimeException re) {
+                    throw re;
+                }
+                throw new RuntimeException(t);
+            }
+            collected.add((StreamIndexDocumentsResponse) next);
         }
-        return responses;
     }
 
     /**

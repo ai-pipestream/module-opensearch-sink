@@ -2,19 +2,25 @@ package ai.pipestream.module.opensearchsink;
 
 import com.google.protobuf.Timestamp;
 import ai.pipestream.data.v1.*;
+import ai.pipestream.data.module.v1.PipeStepProcessorServiceGrpc;
+import ai.pipestream.data.module.v1.ProcessDataRequest;
+import ai.pipestream.data.module.v1.ProcessDataResponse;
+import ai.pipestream.ingestion.v1.OpenSearchIngestionServiceGrpc;
 import ai.pipestream.ingestion.v1.StreamDocumentsRequest;
 import ai.pipestream.ingestion.v1.StreamDocumentsResponse;
-import ai.pipestream.ingestion.v1.MutinyOpenSearchIngestionServiceGrpc;
 import ai.pipestream.module.opensearchsink.plan.IndexPlanCache;
+import ai.pipestream.module.opensearchsink.util.GrpcBidiTestSupport;
 import ai.pipestream.opensearch.v1.IndexPlan;
 import ai.pipestream.opensearch.v1.IndexPlanStatus;
 import ai.pipestream.opensearch.v1.IndexingStrategy;
+import ai.pipestream.opensearch.v1.StreamIndexDocumentsRequest;
+import ai.pipestream.opensearch.v1.StreamIndexDocumentsResponse;
 import ai.pipestream.test.support.OpenSearchSinkWireMockTestResource;
+import io.grpc.Channel;
 import io.quarkus.grpc.GrpcClient;
 import io.quarkus.test.InjectMock;
 import io.quarkus.test.common.QuarkusTestResource;
 import io.quarkus.test.junit.QuarkusTest;
-import io.smallrye.mutiny.Multi;
 import jakarta.inject.Inject;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -32,12 +38,14 @@ import static org.junit.jupiter.api.Assertions.*;
 public class OpenSearchSinkServiceTest {
 
     @GrpcClient("opensearchSink")
-    MutinyOpenSearchIngestionServiceGrpc.MutinyOpenSearchIngestionServiceStub ingestionClient;
+    Channel sinkChannel;
 
     @GrpcClient("opensearchSink")
-    ai.pipestream.data.module.v1.MutinyPipeStepProcessorServiceGrpc.MutinyPipeStepProcessorServiceStub processorClient;
+    PipeStepProcessorServiceGrpc.PipeStepProcessorServiceBlockingStub processorClient;
 
-    @Inject
+    private OpenSearchIngestionServiceGrpc.OpenSearchIngestionServiceStub ingestionStub;
+
+    @InjectMock
     SchemaManagerService schemaManager;
 
     @InjectMock
@@ -50,6 +58,24 @@ public class OpenSearchSinkServiceTest {
 
     @BeforeEach
     void seedPlans() {
+        ingestionStub = OpenSearchIngestionServiceGrpc.newStub(sinkChannel);
+        Mockito.when(schemaManager.determineIndexName(Mockito.anyString()))
+                .thenAnswer(inv -> "pipeline-" + inv.getArgument(0, String.class));
+        Mockito.when(schemaManager.provisioningCacheKey(Mockito.anyString(), Mockito.any()))
+                .thenReturn(null);
+        Mockito.when(schemaManager.streamIndexDocumentsViaManager(Mockito.anyList()))
+                .thenAnswer(inv -> {
+                    @SuppressWarnings("unchecked")
+                    List<StreamIndexDocumentsRequest> reqs = inv.getArgument(0);
+                    return reqs.stream()
+                            .map(req -> StreamIndexDocumentsResponse.newBuilder()
+                                    .setRequestId(req.getRequestId())
+                                    .setDocumentId(req.getDocumentId())
+                                    .setSuccess(true)
+                                    .setMessage("Indexed via WireMock contract stub")
+                                    .build())
+                            .toList();
+                });
         plans = new HashMap<>();
         plans.put("plan-manual-override", IndexPlanCache.FetchOutcome.found(
                 IndexPlan.newBuilder()
@@ -76,9 +102,9 @@ public class OpenSearchSinkServiceTest {
     }
 
     @Test
-    void testStreamDocuments_Success_ContractValidation() {
-        // This test verifies that the Sink correctly formats and sends documents to the platform.
-        // It relies on the High-Fidelity WireMock which validates the Protobuf contract.
+    void testStreamDocuments_Success_ContractValidation() throws InterruptedException {
+        // Exercises the experimental StreamDocuments path end-to-end over gRPC; manager
+        // responses are stubbed because production no longer auto-provisions indices.
         long now = System.currentTimeMillis() / 1000;
         PipeDoc testDoc = createTestDoc("doc-123", "test-doc", now);
 
@@ -87,17 +113,16 @@ public class OpenSearchSinkServiceTest {
                 .setRequestId(UUID.randomUUID().toString())
                 .build();
 
-        List<StreamDocumentsResponse> responses = ingestionClient.streamDocuments(Multi.createFrom().item(request))
-                .collect().asList().await().indefinitely();
+        List<StreamDocumentsResponse> responses = GrpcBidiTestSupport.sendOne(
+                ingestionStub::streamDocuments, request);
 
         assertEquals(1, responses.size());
         assertTrue(responses.get(0).getSuccess());
-        // Verify we got the expected message from our High-Fidelity mock
         assertTrue(responses.get(0).getMessage().contains("WireMock"));
     }
 
     @Test
-    void testStreamDocuments_MultipleSemanticSets_ContractValidation() {
+    void testStreamDocuments_MultipleSemanticSets_ContractValidation() throws InterruptedException {
         PipeDoc testDoc = PipeDoc.newBuilder()
                 .setDocId("doc-multi-set")
                 .setSearchMetadata(SearchMetadata.newBuilder()
@@ -112,15 +137,28 @@ public class OpenSearchSinkServiceTest {
                 .setRequestId(UUID.randomUUID().toString())
                 .build();
 
-        List<StreamDocumentsResponse> responses = ingestionClient.streamDocuments(Multi.createFrom().item(request))
-                .collect().asList().await().indefinitely();
+        List<StreamDocumentsResponse> responses = GrpcBidiTestSupport.sendOne(
+                ingestionStub::streamDocuments, request);
 
         assertTrue(responses.get(0).getSuccess());
     }
 
     @Test
-    void testStreamDocuments_ForcedInternalError() {
-        // Trigger error by using the "fail-this-index" trigger which our high-fidelity mock recognizes
+    void testStreamDocuments_ForcedInternalError() throws InterruptedException {
+        Mockito.when(schemaManager.streamIndexDocumentsViaManager(Mockito.anyList()))
+                .thenAnswer(inv -> {
+                    @SuppressWarnings("unchecked")
+                    List<StreamIndexDocumentsRequest> reqs = inv.getArgument(0);
+                    return reqs.stream()
+                            .map(req -> StreamIndexDocumentsResponse.newBuilder()
+                                    .setRequestId(req.getRequestId())
+                                    .setDocumentId(req.getDocumentId())
+                                    .setSuccess(false)
+                                    .setMessage("Indexing failed: simulated manager error")
+                                    .build())
+                            .toList();
+                });
+
         PipeDoc testDoc = createTestDoc("doc-fail", "fail-this-index", System.currentTimeMillis() / 1000);
 
         StreamDocumentsRequest request = StreamDocumentsRequest.newBuilder()
@@ -128,8 +166,8 @@ public class OpenSearchSinkServiceTest {
                 .setRequestId(UUID.randomUUID().toString())
                 .build();
 
-        List<StreamDocumentsResponse> responses = ingestionClient.streamDocuments(Multi.createFrom().item(request))
-                .collect().asList().await().indefinitely();
+        List<StreamDocumentsResponse> responses = GrpcBidiTestSupport.sendOne(
+                ingestionStub::streamDocuments, request);
 
         assertEquals(1, responses.size());
         assertFalse(responses.get(0).getSuccess());
@@ -161,7 +199,7 @@ public class OpenSearchSinkServiceTest {
                         .build())
                 .build();
 
-        ai.pipestream.data.module.v1.ProcessDataResponse response = processorClient.processData(request).await().indefinitely();
+        ai.pipestream.data.module.v1.ProcessDataResponse response = processorClient.processData(request);
 
         assertEquals(ai.pipestream.data.module.v1.ProcessingOutcome.PROCESSING_OUTCOME_SUCCESS, response.getOutcome());
         // Sink's contract is now "request queued for indexing." Actual

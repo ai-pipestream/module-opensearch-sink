@@ -1,6 +1,6 @@
 package ai.pipestream.module.opensearchsink;
 
-import ai.pipestream.data.module.v1.MutinyPipeStepProcessorServiceGrpc;
+import ai.pipestream.data.module.v1.PipeStepProcessorServiceGrpc;
 import ai.pipestream.data.module.v1.ProcessDataRequest;
 import ai.pipestream.data.module.v1.ProcessDataResponse;
 import ai.pipestream.data.module.v1.ProcessingOutcome;
@@ -17,11 +17,13 @@ import com.google.protobuf.ListValue;
 import com.google.protobuf.Struct;
 import com.google.protobuf.Value;
 import io.quarkus.grpc.GrpcClient;
+import io.quarkus.test.InjectMock;
 import io.quarkus.test.common.QuarkusTestResource;
 import io.quarkus.test.junit.QuarkusTest;
 import jakarta.inject.Inject;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.mockito.Mockito;
 
 import java.util.HashMap;
 import java.util.List;
@@ -50,10 +52,13 @@ import static org.assertj.core.api.Assertions.assertThat;
 public class OpenSearchSinkPlanResolutionTest {
 
     @GrpcClient("opensearchSink")
-    MutinyPipeStepProcessorServiceGrpc.MutinyPipeStepProcessorServiceStub processor;
+    PipeStepProcessorServiceGrpc.PipeStepProcessorServiceBlockingStub processor;
 
     @Inject
     IndexPlanCache planCache;
+
+    @InjectMock
+    OpenSearchIndexingPublisher indexingPublisher;
 
     private Map<String, IndexPlanCache.FetchOutcome> plans;
 
@@ -65,6 +70,10 @@ public class OpenSearchSinkPlanResolutionTest {
             return o == null ? IndexPlanCache.FetchOutcome.missing() : o;
         });
         planCache.invalidateAll();
+
+        Mockito.when(indexingPublisher.publish(
+                Mockito.any(), Mockito.any(), Mockito.any(), Mockito.anyString()))
+                .thenReturn("0-0");
     }
 
     private static IndexPlan readyPlan(String id) {
@@ -103,9 +112,7 @@ public class OpenSearchSinkPlanResolutionTest {
     void readyPlanResolvesAndProcessDataReachesManager() {
         plans.put("plan-ok", IndexPlanCache.FetchOutcome.found(readyPlan("plan-ok")));
 
-        ProcessDataResponse resp = processor
-                .processData(requestWithConfig(configWithPlanIds("plan-ok")))
-                .await().indefinitely();
+        ProcessDataResponse resp = processor.processData(requestWithConfig(configWithPlanIds("plan-ok")));
 
         assertThat(resp.getOutcome())
                 .as("READY plan with reachable manager mock must yield SUCCESS")
@@ -124,9 +131,7 @@ public class OpenSearchSinkPlanResolutionTest {
                         .setLastError("knn provisioning failed")
                         .build()));
 
-        ProcessDataResponse resp = processor
-                .processData(requestWithConfig(configWithPlanIds("plan-bad")))
-                .await().indefinitely();
+        ProcessDataResponse resp = processor.processData(requestWithConfig(configWithPlanIds("plan-bad")));
 
         assertThat(resp.getOutcome())
                 .as("FAILED plan must surface as PROCESSING_OUTCOME_FAILURE")
@@ -141,9 +146,7 @@ public class OpenSearchSinkPlanResolutionTest {
     void missingPlanRejectsRequestWithPlanIdInLog() {
         // No plan registered → fetcher returns Missing()
 
-        ProcessDataResponse resp = processor
-                .processData(requestWithConfig(configWithPlanIds("plan-nope")))
-                .await().indefinitely();
+        ProcessDataResponse resp = processor.processData(requestWithConfig(configWithPlanIds("plan-nope")));
 
         assertThat(resp.getOutcome())
                 .as("missing plan id must surface as PROCESSING_OUTCOME_FAILURE")
@@ -160,8 +163,7 @@ public class OpenSearchSinkPlanResolutionTest {
         // plan-missing not registered
 
         ProcessDataResponse resp = processor
-                .processData(requestWithConfig(configWithPlanIds("plan-ok", "plan-missing")))
-                .await().indefinitely();
+                .processData(requestWithConfig(configWithPlanIds("plan-ok", "plan-missing")));
 
         assertThat(resp.getOutcome())
                 .as("any single missing plan must reject the whole request — no partial indexing")
@@ -173,9 +175,7 @@ public class OpenSearchSinkPlanResolutionTest {
 
     @Test
     void emptyPlanIdsRejectsRequest() {
-        ProcessDataResponse resp = processor
-                .processData(requestWithConfig(configWithPlanIds()))
-                .await().indefinitely();
+        ProcessDataResponse resp = processor.processData(requestWithConfig(configWithPlanIds()));
 
         assertThat(resp.getOutcome())
                 .as("empty plan_ids list must reject — sink requires at least one plan reference")
