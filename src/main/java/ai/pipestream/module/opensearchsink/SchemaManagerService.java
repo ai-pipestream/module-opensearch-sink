@@ -15,14 +15,18 @@ import io.grpc.StatusRuntimeException;
 import io.grpc.stub.StreamObserver;
 import io.quarkus.grpc.GrpcClient;
 import jakarta.annotation.PostConstruct;
+import jakarta.annotation.PreDestroy;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
+import java.util.ArrayList;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
@@ -38,17 +42,27 @@ import java.util.stream.Collectors;
  * isn't pre-provisioned, the manager-side {@code IndexKnnProvisioner} fails
  * the doc loud with a clear pointer.
  * <p>
- * Sink → manager indexing uses the bidi streaming RPC
- * {@code StreamIndexDocuments} on a per-call basis: open a stream, send one
- * request, await one response, close the stream. Plain async-callback gRPC
- * stub on a virtual thread; no Mutiny on the hot path.
+ * Sink → manager indexing uses ONE long-lived bidi {@code StreamIndexDocuments}
+ * stream held for the bean lifetime. Per-doc indexing calls register a
+ * {@link CompletableFuture} in {@link #pending} keyed by {@code request_id},
+ * push the request onto the persistent stream, and block their virtual thread
+ * waiting on the future. The shared response observer routes each manager
+ * response back to the matching future by {@code request_id}. The manager's
+ * server-side batcher ({@code group().intoLists().of(100, 500ms)}) is designed
+ * for exactly this shape — one stream feeding many docs — so per-doc latency
+ * stays bounded by the batch flush interval, not by per-call open/close
+ * handshakes.
+ * <p>
+ * On stream failure the request observer is dropped, every in-flight future
+ * is failed with the cause, and the next call lazily reopens the stream. Plain
+ * async-callback gRPC stub; no Mutiny anywhere on this path.
  */
 @ApplicationScoped
 public class SchemaManagerService {
 
     private static final Logger LOG = Logger.getLogger(SchemaManagerService.class);
 
-    /** Per-call deadline on the bidi sink→manager round-trip. */
+    /** Per-call deadline on the sink→manager round-trip. */
     private static final long INDEX_RPC_TIMEOUT_SECONDS = 30L;
 
     @Inject
@@ -71,10 +85,137 @@ public class SchemaManagerService {
      */
     OpenSearchManagerServiceGrpc.OpenSearchManagerServiceStub managerStub;
 
+    /**
+     * Per-doc correlation: {@code request_id → future-of-response}. Insert
+     * happens-before {@code reqObs.onNext(req)} happens-before manager response,
+     * so the response observer's dispatcher always sees the entry when the
+     * matching response arrives. Cleared on stream failure.
+     */
+    final ConcurrentHashMap<String, CompletableFuture<StreamIndexDocumentsResponse>> pending =
+            new ConcurrentHashMap<>();
+
+    /**
+     * The persistent request-side observer for the long-lived bidi. Volatile
+     * because {@link #handleStreamFailure} replaces it with {@code null} on
+     * disconnect and {@link #ensureStream} rebuilds it. gRPC
+     * {@link StreamObserver#onNext} is NOT thread-safe, so concurrent senders
+     * must serialise on {@link #writeLock}.
+     */
+    private volatile StreamObserver<StreamIndexDocumentsRequest> reqObs;
+
+    /** Serialises {@code reqObs.onNext(...)} across concurrent VT callers. */
+    private final Object writeLock = new Object();
+
+    /** Set in {@link #close()} to suppress reconnect during shutdown. */
+    private volatile boolean shutdown = false;
+
     @PostConstruct
     void init() {
         if (managerStub == null && managerChannel != null) {
             managerStub = OpenSearchManagerServiceGrpc.newStub(managerChannel);
+        }
+        // Eagerly open the persistent stream so the first indexing call
+        // doesn't pay the open-handshake latency.
+        ensureStream();
+    }
+
+    @PreDestroy
+    void close() {
+        shutdown = true;
+        StreamObserver<StreamIndexDocumentsRequest> obs = reqObs;
+        reqObs = null;
+        if (obs != null) {
+            try {
+                synchronized (writeLock) {
+                    obs.onCompleted();
+                }
+            } catch (RuntimeException ignored) {
+                // half-close best-effort during shutdown
+            }
+        }
+        StatusRuntimeException cancel = Status.CANCELLED
+                .withDescription("sink shutting down — manager stream closed")
+                .asRuntimeException();
+        for (var entry : pending.entrySet()) {
+            entry.getValue().completeExceptionally(cancel);
+        }
+        pending.clear();
+    }
+
+    /**
+     * Returns the live request observer, opening a new persistent stream if
+     * one is not currently held. Synchronised so concurrent VT callers can't
+     * race to open multiple streams during a reconnect.
+     */
+    private StreamObserver<StreamIndexDocumentsRequest> ensureStream() {
+        StreamObserver<StreamIndexDocumentsRequest> obs = reqObs;
+        if (obs != null) return obs;
+        synchronized (this) {
+            if (reqObs == null && !shutdown) {
+                openStream();
+            }
+            return reqObs;
+        }
+    }
+
+    /**
+     * Builds a fresh response observer that dispatches each {@code onNext} to
+     * the matching {@link #pending} future by {@code request_id}, and opens a
+     * new bidi against the manager. Caller holds {@code synchronized (this)}.
+     */
+    private void openStream() {
+        if (managerStub == null) {
+            throw Status.UNAVAILABLE
+                    .withDescription("manager stub not initialised (no channel)")
+                    .asRuntimeException();
+        }
+        StreamObserver<StreamIndexDocumentsResponse> respObs = new StreamObserver<>() {
+            @Override
+            public void onNext(StreamIndexDocumentsResponse v) {
+                CompletableFuture<StreamIndexDocumentsResponse> f = pending.remove(v.getRequestId());
+                if (f != null) {
+                    f.complete(v);
+                } else {
+                    // Possible if the future was already failed by reconnect
+                    // and the dead stream's late onNext arrived after.
+                    LOG.debugf("dropped manager response for unknown request_id=%s", v.getRequestId());
+                }
+            }
+
+            @Override
+            public void onError(Throwable t) {
+                LOG.warnf(t, "manager StreamIndexDocuments errored — dropping stream, will reopen on next call");
+                handleStreamFailure(t);
+            }
+
+            @Override
+            public void onCompleted() {
+                LOG.warnf("manager half-closed StreamIndexDocuments unexpectedly — will reopen on next call");
+                handleStreamFailure(Status.UNAVAILABLE
+                        .withDescription("manager half-closed StreamIndexDocuments")
+                        .asRuntimeException());
+            }
+        };
+        reqObs = managerStub.streamIndexDocuments(respObs);
+        LOG.debug("opened persistent StreamIndexDocuments to manager");
+    }
+
+    /**
+     * Drops the current request observer and fails every in-flight future.
+     * Lazy reconnect: the next {@link #ensureStream} call rebuilds the stream.
+     * Idempotent — concurrent failure callbacks (onError + late onNext) are
+     * safe.
+     */
+    private void handleStreamFailure(Throwable cause) {
+        reqObs = null;
+        // Drain pending — any future not yet completed by a real response is
+        // failed with the disconnect cause so its caller sees a clean status.
+        var inFlight = new ArrayList<>(pending.values());
+        pending.clear();
+        for (CompletableFuture<StreamIndexDocumentsResponse> f : inFlight) {
+            if (!f.isDone()) {
+                f.completeExceptionally(cause);
+            }
         }
     }
 
@@ -214,116 +355,135 @@ public class SchemaManagerService {
     }
 
     /**
-     * Stream a micro-batch of indexing requests to the manager via one bidi
-     * call: send every request, half-close, drain every response in order.
-     * The caller is expected to be on a virtual thread; this method blocks
-     * until the manager closes the stream or the per-call deadline expires.
+     * Send a batch of indexing requests onto the persistent bidi stream and
+     * return their responses in REQUEST order (response[i] corresponds to
+     * requests[i]). Each request is registered for correlation by
+     * {@code request_id} and dispatched to the shared response observer
+     * exactly like a single-doc call — this method is just a convenience
+     * "submit N, await N" wrapper around the same persistent stream.
      * <p>
      * Used by the experimental streaming ingestion path
      * ({@code OpenSearchIngestionServiceImpl.streamDocuments}). Tests override
      * this hook to record batch sizes without spinning up a real manager.
      */
-    public java.util.List<StreamIndexDocumentsResponse> streamIndexDocumentsViaManager(
-            java.util.List<StreamIndexDocumentsRequest> requests) {
+    public List<StreamIndexDocumentsResponse> streamIndexDocumentsViaManager(
+            List<StreamIndexDocumentsRequest> requests) {
         if (requests == null || requests.isEmpty()) {
-            return java.util.List.of();
+            return List.of();
         }
-        java.util.concurrent.BlockingQueue<Object> responses = new java.util.concurrent.LinkedBlockingQueue<>();
-        Object COMPLETE = new Object();
-        StreamObserver<StreamIndexDocumentsResponse> respObs = new StreamObserver<>() {
-            @Override public void onNext(StreamIndexDocumentsResponse v) { responses.add(v); }
-            @Override public void onError(Throwable t) { responses.add(t); }
-            @Override public void onCompleted() { responses.add(COMPLETE); }
-        };
-        StreamObserver<StreamIndexDocumentsRequest> reqObs = managerStub.streamIndexDocuments(respObs);
+
+        StreamObserver<StreamIndexDocumentsRequest> obs = ensureStream();
+        if (obs == null) {
+            throw Status.UNAVAILABLE
+                    .withDescription("manager StreamIndexDocuments not open")
+                    .asRuntimeException();
+        }
+
+        // Register every future BEFORE sending so the response dispatcher
+        // can never miss a match due to ordering.
+        List<CompletableFuture<StreamIndexDocumentsResponse>> futures = new ArrayList<>(requests.size());
+        List<String> requestIds = new ArrayList<>(requests.size());
+        for (StreamIndexDocumentsRequest req : requests) {
+            String requestId = req.getRequestId();
+            CompletableFuture<StreamIndexDocumentsResponse> f = new CompletableFuture<>();
+            // If a caller reused a request_id we'd silently drop the prior
+            // future — refuse loud so the bug is visible.
+            if (pending.putIfAbsent(requestId, f) != null) {
+                // unwind every future already registered for this batch
+                for (String already : requestIds) pending.remove(already);
+                throw new IllegalStateException(
+                        "duplicate request_id in pending map: " + requestId);
+            }
+            futures.add(f);
+            requestIds.add(requestId);
+        }
+
         try {
-            for (StreamIndexDocumentsRequest req : requests) {
-                reqObs.onNext(req);
+            synchronized (writeLock) {
+                for (StreamIndexDocumentsRequest req : requests) {
+                    obs.onNext(req);
+                }
             }
-            reqObs.onCompleted();
-        } catch (RuntimeException e) {
-            try {
-                reqObs.onError(e);
-            } catch (RuntimeException ignored) {
-                // already failed; surface the original
-            }
-            throw e;
+        } catch (RuntimeException sendError) {
+            for (String id : requestIds) pending.remove(id);
+            handleStreamFailure(sendError);
+            throw sendError;
         }
-        java.util.List<StreamIndexDocumentsResponse> collected = new java.util.ArrayList<>(requests.size());
-        long deadlineNanos = System.nanoTime()
-                + java.util.concurrent.TimeUnit.SECONDS.toNanos(INDEX_RPC_TIMEOUT_SECONDS);
-        while (true) {
+
+        // Drain in request order — each future independently bounded by the
+        // per-call deadline; the deadline applies to the WHOLE batch in
+        // wall-clock terms so a slow doc can't extend the deadline for the
+        // ones behind it.
+        List<StreamIndexDocumentsResponse> responses = new ArrayList<>(requests.size());
+        long deadlineNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(INDEX_RPC_TIMEOUT_SECONDS);
+        for (int i = 0; i < futures.size(); i++) {
+            CompletableFuture<StreamIndexDocumentsResponse> f = futures.get(i);
+            String requestId = requestIds.get(i);
             long remaining = deadlineNanos - System.nanoTime();
-            if (remaining <= 0) {
-                throw Status.DEADLINE_EXCEEDED
-                        .withDescription("timed out after " + INDEX_RPC_TIMEOUT_SECONDS
-                                + "s draining StreamIndexDocuments responses (got "
-                                + collected.size() + " of " + requests.size() + ")")
-                        .asRuntimeException();
-            }
-            Object next;
             try {
-                next = responses.poll(remaining, java.util.concurrent.TimeUnit.NANOSECONDS);
+                if (remaining <= 0) {
+                    throw new TimeoutException();
+                }
+                responses.add(f.get(remaining, TimeUnit.NANOSECONDS));
+            } catch (ExecutionException e) {
+                pending.remove(requestId);
+                Throwable cause = e.getCause() != null ? e.getCause() : e;
+                if (cause instanceof StatusRuntimeException sre) throw sre;
+                if (cause instanceof RuntimeException re) throw re;
+                throw new RuntimeException(cause);
             } catch (InterruptedException e) {
+                pending.remove(requestId);
                 Thread.currentThread().interrupt();
                 throw Status.CANCELLED.withCause(e)
                         .withDescription("interrupted draining StreamIndexDocuments responses")
                         .asRuntimeException();
+            } catch (TimeoutException e) {
+                pending.remove(requestId);
+                throw Status.DEADLINE_EXCEEDED.withCause(e)
+                        .withDescription("timed out after " + INDEX_RPC_TIMEOUT_SECONDS
+                                + "s draining StreamIndexDocuments responses (got "
+                                + responses.size() + " of " + requests.size() + ")")
+                        .asRuntimeException();
             }
-            if (next == null) continue;
-            if (next == COMPLETE) {
-                return collected;
-            }
-            if (next instanceof Throwable t) {
-                if (t instanceof StatusRuntimeException sre) throw sre;
-                if (t instanceof RuntimeException re) throw re;
-                throw new RuntimeException(t);
-            }
-            collected.add((StreamIndexDocumentsResponse) next);
         }
+        return responses;
     }
 
     /**
-     * Open a per-call bidi stream to the manager's {@code StreamIndexDocuments},
-     * send one request, await one response, close the stream. Plain blocking;
-     * the caller is expected to be on a virtual thread.
+     * Push a single request onto the persistent bidi stream and await its
+     * matching response. Correlation is by {@code request_id} via
+     * {@link #pending}; the shared response observer dispatches manager
+     * replies back to this future. Caller is expected to be on a virtual
+     * thread — the {@link CompletableFuture#get} parks the VT cleanly.
      */
     StreamIndexDocumentsResponse streamOne(StreamIndexDocumentsRequest request) {
+        StreamObserver<StreamIndexDocumentsRequest> obs = ensureStream();
+        if (obs == null) {
+            throw Status.UNAVAILABLE
+                    .withDescription("manager StreamIndexDocuments not open")
+                    .asRuntimeException();
+        }
+
+        String requestId = request.getRequestId();
         CompletableFuture<StreamIndexDocumentsResponse> future = new CompletableFuture<>();
-        StreamObserver<StreamIndexDocumentsResponse> respObs = new StreamObserver<>() {
-            @Override
-            public void onNext(StreamIndexDocumentsResponse v) {
-                future.complete(v);
-            }
+        if (pending.putIfAbsent(requestId, future) != null) {
+            throw new IllegalStateException("duplicate request_id in pending map: " + requestId);
+        }
 
-            @Override
-            public void onError(Throwable t) {
-                future.completeExceptionally(t);
-            }
-
-            @Override
-            public void onCompleted() {
-                if (!future.isDone()) {
-                    future.completeExceptionally(Status.INTERNAL
-                            .withDescription("manager StreamIndexDocuments closed without a response")
-                            .asRuntimeException());
-                }
-            }
-        };
-
-        StreamObserver<StreamIndexDocumentsRequest> reqObs = managerStub.streamIndexDocuments(respObs);
         try {
-            reqObs.onNext(request);
-            reqObs.onCompleted();
-        } catch (RuntimeException e) {
-            // If the half-close throws, surface a clean status so callers see
-            // the underlying transport problem rather than a half-future.
-            future.completeExceptionally(e);
+            synchronized (writeLock) {
+                obs.onNext(request);
+            }
+        } catch (RuntimeException sendError) {
+            pending.remove(requestId);
+            handleStreamFailure(sendError);
+            throw sendError;
         }
 
         try {
             return future.get(INDEX_RPC_TIMEOUT_SECONDS, TimeUnit.SECONDS);
         } catch (ExecutionException e) {
+            pending.remove(requestId);
             Throwable cause = e.getCause() != null ? e.getCause() : e;
             if (cause instanceof StatusRuntimeException sre) {
                 throw sre;
@@ -333,14 +493,16 @@ public class SchemaManagerService {
             }
             throw new RuntimeException(cause);
         } catch (InterruptedException e) {
+            pending.remove(requestId);
             Thread.currentThread().interrupt();
             throw Status.CANCELLED.withCause(e)
                     .withDescription("interrupted awaiting StreamIndexDocuments response")
                     .asRuntimeException();
         } catch (TimeoutException e) {
+            pending.remove(requestId);
             throw Status.DEADLINE_EXCEEDED.withCause(e)
                     .withDescription("timed out after " + INDEX_RPC_TIMEOUT_SECONDS
-                            + "s awaiting StreamIndexDocuments response")
+                            + "s awaiting StreamIndexDocuments response (request_id=" + requestId + ")")
                     .asRuntimeException();
         }
     }
