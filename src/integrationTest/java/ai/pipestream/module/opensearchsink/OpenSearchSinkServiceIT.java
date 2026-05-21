@@ -39,7 +39,8 @@ public class OpenSearchSinkServiceIT {
     void setUp() {
         // The application is running in a container, but the gRPC port is mapped to the host.
         // We connect to the mapped port.
-        channel = ManagedChannelBuilder.forAddress("localhost", 39104).usePlaintext().build();
+        // Unified server: gRPC is on the HTTP port (%dev.quarkus.http.port=19104).
+        channel = ManagedChannelBuilder.forAddress("localhost", 19104).usePlaintext().build();
         ingestionStub = OpenSearchIngestionServiceGrpc.newStub(channel);
         testClient = new OpenSearchTestClient("localhost", 9200);
     }

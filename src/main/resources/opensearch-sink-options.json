@@ -3,41 +3,47 @@
   "title": "OpenSearchSinkOptions",
   "description": "Configuration for the OpenSearch Sink module. Each sink references one or more IndexPlans which govern the physical index, indexing strategy, and vector field set.",
   "type": "object",
-  "required": ["opensearch_instance", "plan_ids"],
+  "additionalProperties": false,
   "properties": {
     "opensearch_instance": {
       "type": "string",
+      "title": "OpenSearch Instance",
       "description": "Consul service name of the target OpenSearch instance.",
-      "examples": ["opensearch-cluster", "search-prod"]
+      "default": "opensearch-cluster"
     },
     "plan_ids": {
       "type": "array",
-      "description": "IndexPlan ids governing the indices this sink writes to. Must contain at least one entry.",
-      "minItems": 1,
       "items": {
         "type": "string"
       },
-      "examples": [["plan-articles-v1"], ["plan-articles-v1", "plan-summaries-v1"]]
+      "title": "Plan IDs",
+      "description": "IndexPlan ids governing the indices this sink writes to. Must contain at least one entry; every referenced plan must exist and be in READY status or the sink rejects the request."
     },
     "batch_options": {
       "type": "object",
-      "description": "Controls how documents are batched for bulk indexing on the experimental streaming path.",
+      "title": "Batch Options",
+      "description": "Controls how documents are batched for bulk indexing.",
+      "additionalProperties": false,
       "properties": {
         "max_batch_size": {
           "type": "integer",
-          "default": 100,
+          "title": "Max Batch Size",
+          "description": "Maximum number of documents to include in a single bulk request to OpenSearch.",
           "minimum": 1,
-          "maximum": 10000
+          "maximum": 10000,
+          "default": 100
         },
         "max_time_window_ms": {
           "type": "integer",
-          "default": 500,
+          "title": "Max Time Window (ms)",
+          "description": "Maximum time in milliseconds to buffer documents before sending a bulk request.",
           "minimum": 10,
-          "maximum": 60000
+          "maximum": 60000,
+          "default": 500
         }
       },
-      "additionalProperties": false
+      "required": ["max_batch_size", "max_time_window_ms"]
     }
   },
-  "additionalProperties": false
+  "required": ["opensearch_instance", "plan_ids"]
 }

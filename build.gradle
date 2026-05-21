@@ -35,7 +35,7 @@ pipestreamProtos {
 
     modules {
         register("common")
-        register("module-worker")
+        // module-worker stubs come from pipestream-server (ModuleWorkerLoop); do not regenerate here.
         register("pipeline-module")
         register("opensearch")
         register("schemamanager")
@@ -71,6 +71,7 @@ dependencies {
     implementation 'ai.pipestream:pipestream-quarkus-devservices'
     implementation 'ai.pipestream:quarkus-dynamic-grpc'
     implementation 'ai.pipestream:pipestream-service-registration'
+    // ModuleWorkServiceGrpc stubs + worker-loop framework; do not regenerate module-worker protos here.
     implementation 'ai.pipestream:pipestream-server'
 
     // Caching
