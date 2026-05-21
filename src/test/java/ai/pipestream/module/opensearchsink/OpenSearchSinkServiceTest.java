@@ -2,9 +2,9 @@ package ai.pipestream.module.opensearchsink;
 
 import com.google.protobuf.Timestamp;
 import ai.pipestream.data.v1.*;
-import ai.pipestream.data.module.v1.PipeStepProcessorServiceGrpc;
-import ai.pipestream.data.module.v1.ProcessDataRequest;
-import ai.pipestream.data.module.v1.ProcessDataResponse;
+import ai.pipestream.data.v1.PipeStream;
+import ai.pipestream.module.opensearchsink.support.PipeStreamTestSupport;
+import ai.pipestream.module.opensearchsink.work.OpenSearchModuleProcessor;
 import ai.pipestream.ingestion.v1.OpenSearchIngestionServiceGrpc;
 import ai.pipestream.ingestion.v1.StreamDocumentsRequest;
 import ai.pipestream.ingestion.v1.StreamDocumentsResponse;
@@ -40,8 +40,8 @@ public class OpenSearchSinkServiceTest {
     @GrpcClient("opensearchSink")
     Channel sinkChannel;
 
-    @GrpcClient("opensearchSink")
-    PipeStepProcessorServiceGrpc.PipeStepProcessorServiceBlockingStub processorClient;
+    @Inject
+    OpenSearchModuleProcessor processor;
 
     private OpenSearchIngestionServiceGrpc.OpenSearchIngestionServiceStub ingestionStub;
 
@@ -175,40 +175,19 @@ public class OpenSearchSinkServiceTest {
     }
 
     @Test
-    void testProcessData_CustomConfig_RoutingToSpecificIndex() {
-        // This test simulates the engine passing a custom JSON configuration
+    void testProcessData_CustomConfig_RoutingToSpecificIndex() throws Exception {
         long now = System.currentTimeMillis() / 1000;
         PipeDoc testDoc = createTestDoc("doc-custom-cfg", "any-type", now);
 
-        // Build the Struct that JSONForms would produce. The sink config now
-        // references an IndexPlan id; the test seeds the IndexPlanCache with
-        // a READY plan whose index_name matches the manual-override-index
-        // string the WireMock manager mock expects.
-        com.google.protobuf.ListValue planIds = com.google.protobuf.ListValue.newBuilder()
-                .addValues(com.google.protobuf.Value.newBuilder().setStringValue("plan-manual-override").build())
-                .build();
-        com.google.protobuf.Struct jsonConfig = com.google.protobuf.Struct.newBuilder()
-                .putFields("opensearch_instance", com.google.protobuf.Value.newBuilder().setStringValue("prod-cluster").build())
-                .putFields("plan_ids", com.google.protobuf.Value.newBuilder().setListValue(planIds).build())
-                .build();
+        PipeStream result = processor.process(
+                PipeStreamTestSupport.withSinkConfig(testDoc, "prod-cluster", "plan-manual-override"));
 
-        ai.pipestream.data.module.v1.ProcessDataRequest request = ai.pipestream.data.module.v1.ProcessDataRequest.newBuilder()
-                .setDocument(testDoc)
-                .setConfig(ai.pipestream.data.v1.ProcessConfiguration.newBuilder()
-                        .setJsonConfig(jsonConfig)
-                        .build())
-                .build();
-
-        ai.pipestream.data.module.v1.ProcessDataResponse response = processorClient.processData(request);
-
-        assertEquals(ai.pipestream.data.module.v1.ProcessingOutcome.PROCESSING_OUTCOME_SUCCESS, response.getOutcome());
-        // Sink's contract is now "request queued for indexing." Actual
-        // OpenSearch durability is reported asynchronously by the manager-side
-        // consumer in Phase 2; the audit trail at this layer reflects the
-        // queue handoff.
-        assertTrue(response.getLogEntriesList().stream()
-                .map(LogEntry::getMessage)
-                .anyMatch(log -> log.contains("queued")));
+        assertEquals("doc-custom-cfg", result.getDocument().getDocId());
+        Mockito.verify(indexingPublisher).publish(
+                Mockito.argThat(plan -> "plan-manual-override".equals(plan.id())),
+                Mockito.eq(testDoc),
+                Mockito.any(),
+                Mockito.anyString());
     }
 
     private PipeDoc createTestDoc(String docId, String docType, long timestamp) {

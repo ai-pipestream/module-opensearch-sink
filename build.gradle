@@ -35,6 +35,7 @@ pipestreamProtos {
 
     modules {
         register("common")
+        register("module-worker")
         register("pipeline-module")
         register("opensearch")
         register("schemamanager")

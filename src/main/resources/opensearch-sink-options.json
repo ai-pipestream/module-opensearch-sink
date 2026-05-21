@@ -1,0 +1,43 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "OpenSearchSinkOptions",
+  "description": "Configuration for the OpenSearch Sink module. Each sink references one or more IndexPlans which govern the physical index, indexing strategy, and vector field set.",
+  "type": "object",
+  "required": ["opensearch_instance", "plan_ids"],
+  "properties": {
+    "opensearch_instance": {
+      "type": "string",
+      "description": "Consul service name of the target OpenSearch instance.",
+      "examples": ["opensearch-cluster", "search-prod"]
+    },
+    "plan_ids": {
+      "type": "array",
+      "description": "IndexPlan ids governing the indices this sink writes to. Must contain at least one entry.",
+      "minItems": 1,
+      "items": {
+        "type": "string"
+      },
+      "examples": [["plan-articles-v1"], ["plan-articles-v1", "plan-summaries-v1"]]
+    },
+    "batch_options": {
+      "type": "object",
+      "description": "Controls how documents are batched for bulk indexing on the experimental streaming path.",
+      "properties": {
+        "max_batch_size": {
+          "type": "integer",
+          "default": 100,
+          "minimum": 1,
+          "maximum": 10000
+        },
+        "max_time_window_ms": {
+          "type": "integer",
+          "default": 500,
+          "minimum": 10,
+          "maximum": 60000
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

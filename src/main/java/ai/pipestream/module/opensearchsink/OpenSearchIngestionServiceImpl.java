@@ -21,8 +21,8 @@ import java.util.Map;
 
 /**
  * gRPC service implementation for the OpenSearch sink's experimental direct
- * ingestion stream. Distinct from {@link OpenSearchPipeStepProcessorImpl},
- * which handles the production module-step entrypoint used by the engine.
+ * ingestion stream. Distinct from {@link ai.pipestream.module.opensearchsink.work.OpenSearchModuleProcessor},
+ * which handles the production demand-pull entrypoint used by the engine.
  *
  * <p>{@code streamDocuments} is a bidi stream of documents direct from a
  * loader into the sink. The sink batches them into micro-batches of 100,
