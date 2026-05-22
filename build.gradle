@@ -25,10 +25,9 @@ scmVersion {
     }
 }
 
-// Proto toolchain configuration - uses git-proto-workspace mode for cross-module imports
 pipestreamProtos {
     sourceMode = 'git-proto-workspace'
-    gitRepo = "https://github.com/ai-pipestream/pipestream-protos.git"
+    gitRepo = "/work/worktrees/pipestream-protos-pr0"
     gitRef = "bom/engine-refactor-pr0"
     generateMutiny = false
     generateDescriptors = true
@@ -39,6 +38,8 @@ pipestreamProtos {
         register("pipeline-module")
         register("opensearch")
         register("schemamanager")
+        register("repo")
+        register("config")
     }
 }
 
@@ -63,9 +64,15 @@ dependencies {
     // OpenSearch Java client types (mapping types for schema, etc.)
     implementation libs.opensearch.java
 
-    // Redis: sink XADDs IndexRequest protobuf to pipestream:indexing:<plan_id>;
-    // opensearch-manager consumes these streams (Phase 2). Producer-only here.
-    implementation 'io.quarkus:quarkus-redis-client'
+    // Redis dependency removed: the sink no longer XADDs to
+    // pipestream:indexing:<plan_id> streams. The indexing-request
+    // transport moved to Kafka (publisher emits IndexingRequestEvent
+    // on the indexing-requests topic via Apicurio ProtobufEmitter,
+    // claim-check via repo-service S3 for large payloads). No code
+    // in this module touches Redis any longer. Keeping the dependency
+    // would auto-start a Redis devservice in dev mode that tries to
+    // join pipeline-shared-devservices_default and fails when that
+    // compose network isn't up.
 
     // Pipestream platform libraries
     implementation 'ai.pipestream:pipestream-quarkus-devservices'
@@ -73,6 +80,8 @@ dependencies {
     implementation 'ai.pipestream:pipestream-service-registration'
     // ModuleWorkServiceGrpc stubs + worker-loop framework; do not regenerate module-worker protos here.
     implementation 'ai.pipestream:pipestream-server'
+    implementation 'io.quarkus:quarkus-messaging-kafka'
+    implementation 'ai.pipestream:quarkus-apicurio-registry-protobuf'
 
     // Caching
     implementation libs.caffeine
