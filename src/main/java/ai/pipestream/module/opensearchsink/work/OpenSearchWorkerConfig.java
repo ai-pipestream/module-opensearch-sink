@@ -1,12 +1,10 @@
 package ai.pipestream.module.opensearchsink.work;
 
 import ai.pipestream.data.v1.PipeStream;
-import ai.pipestream.module.work.v1.ModuleWorkServiceGrpc;
-import ai.pipestream.server.work.ModuleWorkerLoop;
-import ai.pipestream.server.work.WorkerLoopConfig;
-import io.grpc.Channel;
+import ai.pipestream.module.runtime.work.ModuleWorkEngineClient;
+import ai.pipestream.module.runtime.work.ModuleWorkerLoop;
+import ai.pipestream.module.runtime.work.WorkerLoopConfig;
 import io.quarkus.arc.profile.IfBuildProfile;
-import io.quarkus.grpc.GrpcClient;
 import io.quarkus.runtime.ShutdownEvent;
 import io.quarkus.runtime.StartupEvent;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -26,14 +24,14 @@ public class OpenSearchWorkerConfig {
     @Inject
     OpenSearchModuleProcessor processor;
 
+    @Inject
+    ModuleWorkEngineClient engineClient;
+
     @Produces
     @Singleton
-    ModuleWorkerLoop<PipeStream> openSearchWorkerLoop(
-            @GrpcClient("engine") Channel engineChannel,
-            WorkerLoopConfig config) {
-        ModuleWorkServiceGrpc.ModuleWorkServiceStub stub =
-                ModuleWorkServiceGrpc.newStub(engineChannel);
-        return new ModuleWorkerLoop<>(PipeStream.class, processor, stub, config);
+    ModuleWorkerLoop<PipeStream> openSearchWorkerLoop(WorkerLoopConfig config) {
+        return new ModuleWorkerLoop<>(
+                PipeStream.class, processor, engineClient, config);
     }
 
     void onStart(@Observes StartupEvent ev, ModuleWorkerLoop<PipeStream> loop) {

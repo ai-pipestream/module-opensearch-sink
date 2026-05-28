@@ -78,8 +78,9 @@ dependencies {
     implementation 'ai.pipestream:pipestream-quarkus-devservices'
     implementation 'ai.pipestream:quarkus-dynamic-grpc'
     implementation 'ai.pipestream:pipestream-service-registration'
-    // ModuleWorkServiceGrpc stubs + worker-loop framework; do not regenerate module-worker protos here.
     implementation 'ai.pipestream:pipestream-server'
+    // ModuleWorkServiceGrpc stubs + worker-loop framework; do not regenerate module-worker protos here.
+    implementation 'ai.pipestream:pipestream-module-runtime'
     implementation 'io.quarkus:quarkus-messaging-kafka'
     implementation 'ai.pipestream:quarkus-apicurio-registry-protobuf'
 

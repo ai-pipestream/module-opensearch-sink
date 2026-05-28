@@ -9,7 +9,7 @@ import ai.pipestream.module.opensearchsink.plan.PlanResolutionException;
 import ai.pipestream.module.opensearchsink.plan.ResolvedPlan;
 import ai.pipestream.module.opensearchsink.service.ConversionResult;
 import ai.pipestream.module.opensearchsink.service.DocumentConverterService;
-import ai.pipestream.server.work.ModuleProcessor;
+import ai.pipestream.module.runtime.work.ModuleProcessor;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.enterprise.context.ApplicationScoped;

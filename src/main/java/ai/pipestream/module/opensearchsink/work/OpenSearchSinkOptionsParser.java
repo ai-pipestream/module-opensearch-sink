@@ -1,7 +1,7 @@
 package ai.pipestream.module.opensearchsink.work;
 
 import ai.pipestream.module.opensearchsink.config.OpenSearchSinkOptions;
-import ai.pipestream.server.work.ModuleProcessor;
+import ai.pipestream.module.runtime.work.ModuleProcessor;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;

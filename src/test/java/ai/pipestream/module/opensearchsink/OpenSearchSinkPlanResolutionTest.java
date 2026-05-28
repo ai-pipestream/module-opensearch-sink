@@ -9,7 +9,7 @@ import ai.pipestream.module.opensearchsink.work.OpenSearchModuleProcessor;
 import ai.pipestream.opensearch.v1.IndexPlan;
 import ai.pipestream.opensearch.v1.IndexPlanStatus;
 import ai.pipestream.opensearch.v1.IndexingStrategy;
-import ai.pipestream.server.work.ModuleProcessor;
+import ai.pipestream.module.runtime.work.ModuleProcessor;
 import ai.pipestream.test.support.OpenSearchSinkWireMockTestResource;
 import io.quarkus.test.InjectMock;
 import io.quarkus.test.common.QuarkusTestResource;
