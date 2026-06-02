@@ -7,12 +7,12 @@ import ai.pipestream.data.v1.PipeDoc;
 import ai.pipestream.data.v1.SearchMetadata;
 import ai.pipestream.data.v1.SemanticChunk;
 import ai.pipestream.data.v1.SemanticProcessingResult;
-import ai.pipestream.ingestion.proto.IngestionRequest;
-import ai.pipestream.ingestion.proto.IngestionResponse;
-import ai.pipestream.ingestion.proto.MutinyOpenSearchIngestionGrpc;
+import ai.pipestream.ingestion.v1.OpenSearchIngestionServiceGrpc;
+import ai.pipestream.ingestion.v1.StreamDocumentsRequest;
+import ai.pipestream.ingestion.v1.StreamDocumentsResponse;
+import ai.pipestream.module.opensearchsink.util.GrpcBidiTestSupport;
 import ai.pipestream.module.opensearchsink.util.OpenSearchTestClient;
 import io.quarkus.test.junit.QuarkusIntegrationTest;
-import io.smallrye.mutiny.Multi;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Disabled;
@@ -31,7 +31,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 public class OpenSearchSinkServiceIT {
 
     private ManagedChannel channel;
-    private MutinyOpenSearchIngestionGrpc.MutinyOpenSearchIngestionStub client;
+    private OpenSearchIngestionServiceGrpc.OpenSearchIngestionServiceStub ingestionStub;
     private OpenSearchTestClient testClient;
     private final String indexName = "pipeline-test-doc"; // Hardcoded for simplicity
 
@@ -39,8 +39,9 @@ public class OpenSearchSinkServiceIT {
     void setUp() {
         // The application is running in a container, but the gRPC port is mapped to the host.
         // We connect to the mapped port.
-        channel = ManagedChannelBuilder.forAddress("localhost", 39104).usePlaintext().build();
-        client = MutinyOpenSearchIngestionGrpc.newMutinyStub(channel);
+        // Unified server: gRPC is on the HTTP port (%dev.quarkus.http.port=19104).
+        channel = ManagedChannelBuilder.forAddress("localhost", 19104).usePlaintext().build();
+        ingestionStub = OpenSearchIngestionServiceGrpc.newStub(channel);
         testClient = new OpenSearchTestClient("localhost", 9200);
     }
 
@@ -52,7 +53,7 @@ public class OpenSearchSinkServiceIT {
     }
 
     @Test
-    void testStreamDocuments() throws IOException {
+    void testStreamDocuments() throws IOException, InterruptedException {
         // 1. Prepare the test data
         PipeDoc testDoc = PipeDoc.newBuilder()
                 .setDocId("doc-456")
@@ -74,14 +75,14 @@ public class OpenSearchSinkServiceIT {
                         .build())
                 .build();
 
-        IngestionRequest request = IngestionRequest.newBuilder()
+        StreamDocumentsRequest request = StreamDocumentsRequest.newBuilder()
                 .setDocument(testDoc)
                 .setRequestId(UUID.randomUUID().toString())
                 .build();
 
         // 2. Stream the request to the service
-        List<IngestionResponse> responses = client.streamDocuments(Multi.createFrom().item(request))
-                .collect().asList().await().indefinitely();
+        List<StreamDocumentsResponse> responses = GrpcBidiTestSupport.sendOne(
+                ingestionStub::streamDocuments, request);
 
         // 3. Assert the response
         assertEquals(1, responses.size());

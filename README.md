@@ -47,7 +47,7 @@ Notes
 
 ## OpenSearch integration
 
-This module integrates with OpenSearch through the OpenSearch Manager gRPC service (MutinyOpenSearchManagerServiceGrpc). The manager is responsible for index creation, mapping updates, and document indexing. The sink focuses on:
+This module integrates with OpenSearch through the OpenSearch Manager gRPC service (`OpenSearchManagerServiceGrpc` async stub on a virtual thread). The manager is responsible for index creation, mapping updates, and document indexing. The sink focuses on:
 
 - Transforming pipeline documents to an OpenSearch‑ready shape.
 - Choosing the index name per document type.

@@ -183,17 +183,22 @@ class DocumentConverterServiceTest {
     }
 
     @Test
-    void skipsResultsWithMissingEmbeddingConfigId() {
+    void chunkerOnlyResultSetIsDroppedSilently() {
+        // A chunker-only graph produces a SemanticProcessingResult with chunk_config_id
+        // set but embedding_config_id empty. There's no vector to score against, so we
+        // don't index it as a SemanticVectorSet — but the base document still indexes
+        // (body/title/etc), and we don't warn or fail. Audit log records it as info.
         PipeDoc doc = PipeDoc.newBuilder()
                 .setDocId("id")
                 .setSearchMetadata(SearchMetadata.newBuilder()
+                        .setBody("Test Body Content")
                         .addSemanticResults(SemanticProcessingResult.newBuilder()
                                 .setSourceFieldName("body")
                                 .setChunkConfigId("c1")
-                                // no embedding_config_id
+                                // no embedding_config_id — chunker-only path
                                 .addChunks(SemanticChunk.newBuilder()
                                         .setEmbeddingInfo(ChunkEmbedding.newBuilder()
-                                                .setTextContent("text").addVector(0.1f).build()))
+                                                .setTextContent("text").build()))
                                 .build())
                         .addSemanticResults(buildResult("body", "c1", "m1", "text", 0.1f))
                         .build())
@@ -202,9 +207,51 @@ class DocumentConverterServiceTest {
         ConversionResult result = converter.convertWithAuditLog(doc);
 
         assertThat(result.document().getSemanticSetsCount())
-                .as("only valid result passes through").isEqualTo(1);
-        assertThat(result.auditLogs()).as("audit log mentions skipped set")
-                .anyMatch(l -> l.contains("Skipping"));
+                .as("only the embedded set passes through, chunker-only is dropped")
+                .isEqualTo(1);
+        assertThat(result.document().getBody())
+                .as("base document body still populated for chunker-only path")
+                .isEqualTo("Test Body Content");
+        assertThat(result.auditLogs())
+                .as("audit log records chunker-only skip without warning")
+                .anyMatch(l -> l.contains("chunker-only result set"))
+                .noneMatch(l -> l.contains("Skipping semantic result set"));
+    }
+
+    @Test
+    void chunkerOnlyDocument_indexesBaseFieldsWithNoSemanticSets() {
+        // Pure chunker-only: every result set lacks embedding_config_id. Expectation:
+        // OpenSearchDocument has 0 semantic_sets but is still a valid indexable doc.
+        PipeDoc doc = PipeDoc.newBuilder()
+                .setDocId("chunker-only-doc")
+                .setSearchMetadata(SearchMetadata.newBuilder()
+                        .setDocumentType("article")
+                        .setTitle("Chunker-only Title")
+                        .setBody("Body text the user wants searchable")
+                        .addSemanticResults(SemanticProcessingResult.newBuilder()
+                                .setSourceFieldName("body")
+                                .setChunkConfigId("token_500")
+                                .addChunks(SemanticChunk.newBuilder()
+                                        .setEmbeddingInfo(ChunkEmbedding.newBuilder()
+                                                .setTextContent("chunk one").build()))
+                                .addChunks(SemanticChunk.newBuilder()
+                                        .setEmbeddingInfo(ChunkEmbedding.newBuilder()
+                                                .setTextContent("chunk two").build()))
+                                .build())
+                        .build())
+                .build();
+
+        ConversionResult result = converter.convertWithAuditLog(doc);
+
+        assertThat(result.document().getSemanticSetsCount())
+                .as("chunker-only docs produce zero semantic_sets")
+                .isZero();
+        assertThat(result.document().getOriginalDocId())
+                .as("base doc identity preserved").isEqualTo("chunker-only-doc");
+        assertThat(result.document().getTitle())
+                .as("base doc title preserved").isEqualTo("Chunker-only Title");
+        assertThat(result.document().getBody())
+                .as("base doc body preserved").isEqualTo("Body text the user wants searchable");
     }
 
     @Test

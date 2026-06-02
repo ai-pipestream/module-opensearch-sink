@@ -25,19 +25,21 @@ scmVersion {
     }
 }
 
-// Proto toolchain configuration - uses git-proto-workspace mode for cross-module imports
 pipestreamProtos {
     sourceMode = 'git-proto-workspace'
     gitRepo = "https://github.com/ai-pipestream/pipestream-protos.git"
     gitRef = "main"
-    generateMutiny = true
+    generateMutiny = false
     generateDescriptors = true
 
     modules {
         register("common")
+        // module-worker stubs come from pipestream-server (ModuleWorkerLoop); do not regenerate here.
         register("pipeline-module")
         register("opensearch")
         register("schemamanager")
+        register("repo")
+        register("config")
     }
 }
 
@@ -62,11 +64,28 @@ dependencies {
     // OpenSearch Java client types (mapping types for schema, etc.)
     implementation libs.opensearch.java
 
+    // Redis dependency removed: the sink no longer XADDs to
+    // pipestream:indexing:<plan_id> streams. The indexing-request
+    // transport moved to Kafka (publisher emits IndexingRequestEvent
+    // on the indexing-requests topic via Apicurio ProtobufEmitter,
+    // claim-check via repo-service S3 for large payloads). No code
+    // in this module touches Redis any longer. Keeping the dependency
+    // would auto-start a Redis devservice in dev mode that tries to
+    // join pipeline-shared-devservices_default and fails when that
+    // compose network isn't up.
+
     // Pipestream platform libraries
     implementation 'ai.pipestream:pipestream-quarkus-devservices'
     implementation 'ai.pipestream:quarkus-dynamic-grpc'
     implementation 'ai.pipestream:pipestream-service-registration'
     implementation 'ai.pipestream:pipestream-server'
+    // ModuleWorkServiceGrpc stubs + worker-loop framework; do not regenerate module-worker protos here.
+    implementation 'ai.pipestream:pipestream-module-runtime'
+    implementation 'io.quarkus:quarkus-messaging-kafka'
+    implementation 'ai.pipestream:quarkus-apicurio-registry-protobuf'
+
+    // Caching
+    implementation libs.caffeine
 
     // Protobuf JSON utilities
     implementation 'com.google.protobuf:protobuf-java-util'
@@ -74,6 +93,7 @@ dependencies {
     // Testing
     testImplementation platform("ai.pipestream:pipestream-bom:${pipestreamBomVersion}")
     testImplementation 'io.quarkus:quarkus-junit5'
+    testImplementation 'io.quarkus:quarkus-junit5-mockito'
     testImplementation 'io.rest-assured:rest-assured'
     testImplementation('ai.pipestream:pipestream-test-support')
     testImplementation libs.assertj.core
