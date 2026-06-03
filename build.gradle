@@ -76,7 +76,6 @@ dependencies {
 
     // Pipestream platform libraries
     implementation 'ai.pipestream:pipestream-quarkus-devservices'
-    implementation 'ai.pipestream:quarkus-dynamic-grpc'
     implementation 'ai.pipestream:pipestream-service-registration'
     implementation 'ai.pipestream:pipestream-server'
     // ModuleWorkServiceGrpc stubs + worker-loop framework; do not regenerate module-worker protos here.
