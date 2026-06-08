@@ -3,6 +3,7 @@ package ai.pipestream.module.opensearchsink.work;
 import ai.pipestream.data.v1.PipeStream;
 import ai.pipestream.module.runtime.work.ModuleWorkEngineClient;
 import ai.pipestream.module.runtime.work.ModuleWorkerLoop;
+import ai.pipestream.module.runtime.work.RampController;
 import ai.pipestream.module.runtime.work.WorkerLoopConfig;
 import io.quarkus.arc.profile.IfBuildProfile;
 import io.quarkus.runtime.ShutdownEvent;
@@ -29,9 +30,9 @@ public class OpenSearchWorkerConfig {
 
     @Produces
     @Singleton
-    ModuleWorkerLoop<PipeStream> openSearchWorkerLoop(WorkerLoopConfig config) {
+    ModuleWorkerLoop<PipeStream> openSearchWorkerLoop(WorkerLoopConfig config, RampController rampController) {
         return new ModuleWorkerLoop<>(
-                PipeStream.class, processor, engineClient, config);
+                PipeStream.class, processor, engineClient, config, rampController);
     }
 
     void onStart(@Observes StartupEvent ev, ModuleWorkerLoop<PipeStream> loop) {
