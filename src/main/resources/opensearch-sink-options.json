@@ -9,7 +9,8 @@
       "type": "string",
       "title": "OpenSearch Instance",
       "description": "Consul service name of the target OpenSearch instance.",
-      "default": "opensearch-cluster"
+      "default": "opensearch-cluster",
+      "x-pipestream-lookup": "opensearch-instances"
     },
     "plan_ids": {
       "type": "array",
@@ -17,7 +18,8 @@
         "type": "string"
       },
       "title": "Plan IDs",
-      "description": "IndexPlan ids governing the indices this sink writes to. Must contain at least one entry; every referenced plan must exist and be in READY status or the sink rejects the request."
+      "description": "IndexPlan ids governing the indices this sink writes to. Must contain at least one entry; every referenced plan must exist and be in READY status or the sink rejects the request.",
+      "x-pipestream-lookup": "index-plans"
     },
     "batch_options": {
       "type": "object",
@@ -42,8 +44,14 @@
           "default": 500
         }
       },
-      "required": ["max_batch_size", "max_time_window_ms"]
+      "required": [
+        "max_batch_size",
+        "max_time_window_ms"
+      ]
     }
   },
-  "required": ["opensearch_instance", "plan_ids"]
+  "required": [
+    "opensearch_instance",
+    "plan_ids"
+  ]
 }
